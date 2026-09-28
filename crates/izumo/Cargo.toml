@@ -48,8 +48,8 @@ http = "1"
 # consumer that wants them names it.
 libc = "0.2"
 raw-window-handle = "0.6"
-tauri = { version = "2", default-features = false, optional = true }
-tauri-runtime = { version = "2", optional = true }
+tauri = { version = "^2", default-features = false, optional = true }
+tauri-runtime = { version = "^2", optional = true }
 tauri-utils = { version = "2", optional = true }
 url = "2"
 winit = "0.31.0-beta.2"
@@ -116,7 +116,7 @@ devtools = ["runtime", "tauri-runtime/devtools"]
 macos-private-api = ["runtime", "tauri/macos-private-api", "tauri-runtime/macos-private-api"]
 
 [dev-dependencies]
-tauri = { version = "2", default-features = false, features = ["test"] }
+tauri = { version = "^2", default-features = false, features = ["test"] }
 # The IPC round-trip test builds a request body and reads the reply back. It was
 # a dev use of a dependency the crate itself carried for the control protocol,
 # so removing that left the test with no JSON: a test dependency now, which is

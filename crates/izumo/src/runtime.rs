@@ -40,6 +40,9 @@ use winit::window::{WindowAttributes, WindowButtons, WindowLevel};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{ApplicationHandlerExtMacOS, WindowAttributesMacOS};
 
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesWindows;
+
 #[cfg(all(feature = "diagnostics", unix))]
 use blitz_control_protocol::document::snapshot_document;
 #[cfg(all(feature = "agent-control", unix))]
@@ -489,16 +492,16 @@ impl<T: UserEvent> RuntimeHandle<T> for BlitzRuntimeHandle<T> {
         Err(raw_window_handle::HandleError::NotSupported)
     }
 
-    fn primary_monitor(&self) -> Option<Monitor> {
-        None
+    fn primary_monitor(&self) -> tauri_runtime::Result<Option<Monitor>> {
+        Ok(None)
     }
 
-    fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<Monitor> {
-        None
+    fn monitor_from_point(&self, _x: f64, _y: f64) -> tauri_runtime::Result<Option<Monitor>> {
+        Ok(None)
     }
 
-    fn available_monitors(&self) -> Vec<Monitor> {
-        Vec::new()
+    fn available_monitors(&self) -> tauri_runtime::Result<Vec<Monitor>> {
+        Ok(Vec::new())
     }
 
     fn cursor_position(&self) -> tauri_runtime::Result<PhysicalPosition<f64>> {
@@ -1058,6 +1061,9 @@ impl<T: UserEvent> Runtime<T> for BlitzRuntime<T> {
     fn set_activation_policy(&mut self, _activation_policy: tauri_runtime::ActivationPolicy) {}
 
     #[cfg(target_os = "macos")]
+    fn set_activate_ignoring_other_apps(&mut self, _ignore: bool) {}
+
+    #[cfg(target_os = "macos")]
     fn set_dock_visibility(&mut self, _visible: bool) {}
 
     #[cfg(target_os = "macos")]
@@ -1353,6 +1359,13 @@ fn window_attributes(builder: &BlitzWindowBuilder) -> WindowAttributes {
             _ => WindowAttributesMacOS::default().with_title_hidden(config.hidden_title),
         };
         attributes = attributes.with_platform_attributes(Box::new(macos_attributes));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let windows_attributes = WindowAttributesWindows::default()
+            .with_no_redirection_bitmap(config.no_redirection_bitmap);
+        attributes = attributes.with_platform_attributes(Box::new(windows_attributes));
     }
 
     attributes

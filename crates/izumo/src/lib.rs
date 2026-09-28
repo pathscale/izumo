@@ -319,4 +319,9 @@ impl WindowBuilder for BlitzWindowBuilder {
         self.config.window_classname = Some(name.into());
         self
     }
+
+    fn no_redirection_bitmap(mut self, enable: bool) -> Self {
+        self.config.no_redirection_bitmap = enable;
+        self
+    }
 }
