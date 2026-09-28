@@ -396,6 +396,41 @@ impl<T: UserEvent> WindowDispatch<T> for BlitzWindowDispatcher<T> {
         Ok(())
     }
 
+    fn set_fullscreen_on_monitor(
+        &self,
+        position: PhysicalPosition<f64>,
+    ) -> tauri_runtime::Result<()> {
+        let fullscreen = self
+            .with_native(|window| {
+                let contains = |origin: i32, size: u32, point: f64| {
+                    let origin = f64::from(origin);
+                    point >= origin && point < origin + f64::from(size)
+                };
+                let monitor = window.available_monitors().find(|monitor| {
+                    // winit 0.31 keeps a monitor's size on its video mode.
+                    let (Some(origin), Some(mode)) =
+                        (monitor.position(), monitor.current_video_mode())
+                    else {
+                        return false;
+                    };
+                    let size = mode.size();
+                    contains(origin.x, size.width, position.x)
+                        && contains(origin.y, size.height, position.y)
+                });
+                if let Some(monitor) = monitor {
+                    window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if fullscreen {
+            self.update_config(|config| config.fullscreen = true);
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     fn set_simple_fullscreen(&self, enable: bool) -> tauri_runtime::Result<()> {
         self.set_fullscreen(enable)
