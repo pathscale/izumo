@@ -1,44 +1,168 @@
 use blitz_script::ScriptDocument;
-use http::{Method, Request};
-use tauri_runtime::webview::{DetachedWebview, WebviewIpcHandler};
-use tauri_runtime::{Runtime, UserEvent};
+use serde_json::Value;
 
-fn ipc_request(page_url: &str, body: String) -> Result<Request<String>, http::Error> {
-    Request::builder()
-        .method(Method::POST)
-        .uri(page_url)
-        .body(body)
-}
+use crate::AppHandle;
 
-/// Connect Boa's `window.ipc.postMessage` host hook to Tauri's existing IPC handler.
+const MAX_REQUEST_ID: u64 = 9_007_199_254_740_991;
+
+/// The chrome client. Install before executing the document's own scripts.
 ///
-/// JavaScript invokes the handler on the document's owning thread. Tauri may finish a command
-/// asynchronously; its response returns through the webview dispatcher's `eval_script` queue.
-pub fn attach_ipc_handler<T, R>(
-    document: &mut ScriptDocument,
-    page_url: String,
-    webview: DetachedWebview<T, R>,
-    handler: WebviewIpcHandler<T, R>,
-) where
-    T: UserEvent,
-    R: Runtime<T>,
-{
-    document.set_ipc_handler(move |body| match ipc_request(&page_url, body) {
-        Ok(request) => handler(webview.clone(), request),
-        Err(error) => eprintln!("izumo: could not construct IPC request: {error}"),
-    });
-}
+/// `invoke(cmd, args)` returns a promise for the command's JSON reply.
+/// `listen(event, callback)` returns a promise for an idempotent unsubscribe
+/// function. Callbacks receive `{ event, id, payload }`.
+const IPC_SHIM: &str = r#"
+(function (global) {
+    "use strict";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    const pending = new Map();
+    const listeners = new Map();
+    let nextRequestId = 1;
+    let nextListenerId = 1;
 
-    #[test]
-    fn ipc_request_preserves_body_and_page_url() {
-        let request = ipc_request("tauri://localhost/settings", r#"{"cmd":"greet"}"#.into())
-            .expect("valid request");
-        assert_eq!(request.method(), Method::POST);
-        assert_eq!(request.uri(), "tauri://localhost/settings");
-        assert_eq!(request.body(), r#"{"cmd":"greet"}"#);
+    function invoke(cmd, args) {
+        if (typeof cmd !== "string" || cmd.trim().length === 0) {
+            return Promise.reject(new TypeError("izumo command must be nonempty"));
+        }
+        if (nextRequestId > Number.MAX_SAFE_INTEGER) {
+            return Promise.reject(new Error("izumo request ids exhausted"));
+        }
+        const id = nextRequestId++;
+        return new Promise(function (resolve, reject) {
+            pending.set(id, { resolve: resolve, reject: reject });
+            try {
+                global.ipc.postMessage(JSON.stringify({
+                    cmd: cmd,
+                    id: id,
+                    args: args === undefined ? {} : args
+                }));
+            } catch (error) {
+                pending.delete(id);
+                reject(error);
+            }
+        });
     }
+
+    function listen(event, callback) {
+        if (typeof event !== "string" || event.trim().length === 0) {
+            return Promise.reject(new TypeError("izumo event must be nonempty"));
+        }
+        if (typeof callback !== "function") {
+            return Promise.reject(new TypeError("izumo listener must be a function"));
+        }
+        if (nextListenerId > Number.MAX_SAFE_INTEGER) {
+            return Promise.reject(new Error("izumo listener ids exhausted"));
+        }
+        const id = nextListenerId++;
+        let callbacks = listeners.get(event);
+        if (!callbacks) {
+            callbacks = new Map();
+            listeners.set(event, callbacks);
+        }
+        callbacks.set(id, callback);
+        let active = true;
+        return Promise.resolve(function () {
+            if (!active) {
+                return;
+            }
+            active = false;
+            callbacks.delete(id);
+            if (callbacks.size === 0) {
+                listeners.delete(event);
+            }
+        });
+    }
+
+    function reply(id, success, payload) {
+        const request = pending.get(id);
+        if (!request) {
+            return;
+        }
+        pending.delete(id);
+        if (success) {
+            request.resolve(payload);
+        } else {
+            request.reject(payload);
+        }
+    }
+
+    function emit(event, payload) {
+        const callbacks = listeners.get(event);
+        if (!callbacks) {
+            return;
+        }
+        for (const entry of Array.from(callbacks.entries())) {
+            const id = entry[0];
+            const callback = entry[1];
+            if (!callbacks.has(id)) {
+                continue;
+            }
+            try {
+                callback({ event: event, id: id, payload: payload });
+            } catch (error) {
+                if (global.console && typeof global.console.error === "function") {
+                    global.console.error("izumo event listener failed", error);
+                }
+            }
+        }
+    }
+
+    Object.defineProperty(global, "__IZUMO__", {
+        value: Object.freeze({
+            invoke: invoke,
+            listen: listen,
+            _reply: reply,
+            _emit: emit
+        }),
+        writable: false,
+        configurable: false,
+        enumerable: false
+    });
+})(window);
+"#;
+
+/// Connect Boa's `window.ipc.postMessage` hook to the application's command table.
+///
+/// Call once on a fresh document, before executing its scripts or polling it.
+/// Commands run on the document thread without holding the command table lock.
+/// Replies and application events return through the same document-thread queue.
+pub fn attach_ipc_handler(document: &mut ScriptDocument, handle: AppHandle) {
+    let scripts = handle.script_queue().clone();
+    scripts.attach_to(document);
+
+    document.set_ipc_handler(move |body| {
+        let mut message = match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Object(message)) => message,
+            Ok(_) => {
+                eprintln!("izumo: IPC request must be an object");
+                return;
+            }
+            Err(error) => {
+                eprintln!("izumo: invalid IPC request: {error}");
+                return;
+            }
+        };
+
+        let id = message
+            .remove("id")
+            .and_then(|value| value.as_u64())
+            .filter(|id| *id > 0 && *id <= MAX_REQUEST_ID);
+        let Some(id) = id else {
+            eprintln!("izumo: IPC request id must be a positive safe integer");
+            return;
+        };
+
+        let cmd = match message.remove("cmd") {
+            Some(Value::String(cmd)) if !cmd.trim().is_empty() => cmd,
+            _ => {
+                scripts.enqueue_reply(id, Err("izumo command must be nonempty".into()));
+                return;
+            }
+        };
+        let args = message
+            .remove("args")
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        scripts.enqueue_reply(id, handle.invoke(&cmd, args));
+    });
+
+    document.eval(IPC_SHIM);
 }
