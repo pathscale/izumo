@@ -832,7 +832,6 @@ fn window_attributes(config: &WindowSpec) -> WindowAttributes {
         // Surface compositing and the renderer's clear color must agree.
         .with_transparent(config.transparent)
         .with_theme(config.theme)
-        .with_focusable(config.focusable)
         .with_active(config.focus);
 
     if let (Some(x), Some(y)) = (config.x, config.y) {
