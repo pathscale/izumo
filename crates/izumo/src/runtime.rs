@@ -1,15 +1,11 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::fmt;
-use std::marker::PhantomData;
 #[cfg(all(feature = "agent-control", unix))]
 use std::sync::Weak;
 #[cfg(target_os = "macos")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(feature = "agent-control", unix))]
+use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::thread::{ThreadId, current};
 
 #[cfg(not(feature = "hybrid-renderer"))]
 use anyrender_vello::VelloWindowRenderer;
@@ -17,21 +13,11 @@ use anyrender_vello::VelloWindowRenderer;
 use anyrender_vello_hybrid::VelloHybridWindowRenderer as VelloWindowRenderer;
 use blitz_script::ScriptDocument;
 use blitz_shell::{
-    BlitzApplication, BlitzShellEvent, BlitzShellProxy, WindowConfig as BlitzShellWindowConfig,
+    BlitzApplication, BlitzShellProxy, WindowConfig as BlitzShellWindowConfig,
     create_default_event_loop,
 };
-use tauri_runtime::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
-use tauri_runtime::monitor::Monitor;
-use tauri_runtime::webview::{DetachedWebview, PendingWebview};
-use tauri_runtime::window::{
-    DetachedWindow, DetachedWindowWebview, PendingWindow, RawWindow, WindowId,
-};
-use tauri_runtime::{
-    DeviceEventFilter, Error, EventLoopProxy, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs,
-    UserEvent,
-};
-use tauri_utils::Theme;
 use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::WindowEvent as WinitWindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::monitor::Fullscreen;
@@ -65,10 +51,9 @@ use blitz_control_protocol::{
  * crate that defines it, because a runtime that forwards one has not removed
  * the edge, only renamed it.
  */
-use crate::window_dispatch::{BlitzWindowDispatcher, NativeWindowState};
-use crate::{
-    BlitzWebviewDispatcher, BlitzWindowBuilder, PreparedBlitzWebview, prepare_pending_webview,
-};
+use crate::{App, AppHandle, AppResult, WindowSpec, attach_ipc_handler};
+#[cfg(target_os = "macos")]
+use crate::TitleBarStyle;
 #[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::in_process::DocumentControl;
 #[cfg(all(feature = "agent-control", unix))]
@@ -87,33 +72,10 @@ static RUNTIME_TRACE: OnceLock<RwLock<Option<Arc<RuntimeTrace>>>> = OnceLock::ne
 static AGENT_CONTROL_RUNTIME: OnceLock<Mutex<Option<Weak<Mutex<AgentControlRuntime>>>>> =
     OnceLock::new();
 
-/// One lock for every test that starts or stops the control server.
+/// Set the document source used by App::run for its chrome window.
 ///
-/// `AGENT_CONTROL_RUNTIME` is process-wide, so two tests that enable
-/// inspection at the same time fight over one listener. This crate keeps its
-/// own lock rather than sharing the transport's: the state being serialised is
-/// this runtime's, and the transport has no idea a second one exists.
-#[cfg(all(feature = "agent-control", unix, test))]
-static CONTROL_TEST_LOCK: nagoya::sync::RwLock<()> = nagoya::sync::RwLock::new(());
-
-thread_local! {
-    static CURRENT_BLITZ_APPLICATION: std::cell::Cell<*const ()> = const {
-        std::cell::Cell::new(std::ptr::null())
-    };
-}
-
-struct CurrentApplicationGuard;
-
-impl Drop for CurrentApplicationGuard {
-    fn drop(&mut self) {
-        CURRENT_BLITZ_APPLICATION.with(|current| current.set(std::ptr::null()));
-    }
-}
-
-/// Set the document source used when Tauri asks the runtime to create a webview.
-///
-/// The first native preview uses an embedded production bundle. Protocol-backed document loading
-/// can replace this factory without changing the runtime or dispatcher path.
+/// The factory receives WindowSpec::url. The runtime attaches the application
+/// IPC bridge and ScriptQueue before the document's first native poll.
 pub fn set_document_factory(
     factory: impl Fn(&str) -> Result<ScriptDocument, String> + Send + Sync + 'static,
 ) {
@@ -269,281 +231,30 @@ fn runtime_trace(message: &str) {
     }
 }
 
-fn create_document(url: &str) -> tauri_runtime::Result<ScriptDocument> {
+fn create_document(url: &str) -> AppResult<ScriptDocument> {
     let factory = DOCUMENT_FACTORY
         .get_or_init(|| RwLock::new(None))
         .read()
         .unwrap()
         .clone()
-        .ok_or_else(|| {
-            Error::CreateWebview(
-                std::io::Error::other("Blitz document factory is not configured").into(),
-            )
-        })?;
-    factory(url).map_err(|error| Error::CreateWebview(std::io::Error::other(error).into()))
+        .ok_or_else(|| std::io::Error::other("Blitz document factory is not configured"))?;
+    factory(url).map_err(|error| std::io::Error::other(error).into())
 }
 
-type Task = Box<dyn FnOnce() + Send + 'static>;
-
-enum RuntimeMessage<T: UserEvent> {
-    Task(Task),
-    UserEvent(T),
-    RequestExit(i32),
-    #[cfg(all(feature = "agent-control", unix))]
+#[cfg(all(feature = "agent-control", unix))]
+enum RuntimeMessage {
     Control {
         request: ControlBridgeRequest,
         response: Arc<Once<DebugResponse>>,
     },
 }
 
-pub(crate) struct BlitzRuntimeContext<T: UserEvent> {
-    sender: Sender<RuntimeMessage<T>>,
-    proxy: BlitzShellProxy,
-    next_window_id: Arc<AtomicU32>,
-    next_window_event_id: Arc<AtomicU32>,
-    windows: Arc<Mutex<HashMap<WindowId, Arc<NativeWindowState>>>>,
-    main_thread_id: ThreadId,
-}
-
-impl<T: UserEvent> Clone for BlitzRuntimeContext<T> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            proxy: self.proxy.clone(),
-            next_window_id: Arc::clone(&self.next_window_id),
-            next_window_event_id: Arc::clone(&self.next_window_event_id),
-            windows: Arc::clone(&self.windows),
-            main_thread_id: self.main_thread_id,
-        }
-    }
-}
-
-impl<T: UserEvent> fmt::Debug for BlitzRuntimeContext<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BlitzRuntimeContext")
-            .field("window_count", &self.windows.lock().unwrap().len())
-            .finish()
-    }
-}
-
-impl<T: UserEvent> BlitzRuntimeContext<T> {
-    pub(crate) fn next_window_event_id(&self) -> tauri_runtime::WindowEventId {
-        self.next_window_event_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn next_window_id(&self) -> WindowId {
-        self.next_window_id.fetch_add(1, Ordering::Relaxed).into()
-    }
-
-    fn send(&self, message: RuntimeMessage<T>) -> tauri_runtime::Result<()> {
-        self.sender
-            .send(message)
-            .map_err(|_| Error::FailedToSendMessage)?;
-        self.proxy.wake_up();
-        Ok(())
-    }
-
-    /// Queued tasks only run when the event loop next drains them, so a caller
-    /// already on the main thread that waits for its task would wait forever:
-    /// the drain is that thread's own job. Tauri does exactly that. Menu
-    /// construction posts the work here and blocks on the reply, and `setup`
-    /// runs on the main thread inside `can_create_surfaces`, so queuing there
-    /// hangs the app before the first window. Running inline is what
-    /// tauri-runtime-wry does, for the same reason.
-    pub(crate) fn run_on_main_thread(
-        &self,
-        task: impl FnOnce() + Send + 'static,
-    ) -> tauri_runtime::Result<()> {
-        if current().id() == self.main_thread_id {
-            task();
-            return Ok(());
-        }
-        self.send(RuntimeMessage::Task(Box::new(task)))
-    }
-
-    pub(crate) fn close_window(&self, id: WindowId) -> tauri_runtime::Result<()> {
-        let native_id = self
-            .windows
-            .lock()
-            .unwrap()
-            .get(&id)
-            .and_then(|state| {
-                state
-                    .native
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|window| window.id())
-            })
-            .ok_or(Error::WindowNotFound)?;
-        self.proxy.send_event(BlitzShellEvent::CloseWindow {
-            window_id: native_id,
-        });
-        Ok(())
-    }
-
-    pub(crate) fn create_window<F: Fn(RawWindow) + Send + 'static>(
-        &self,
-        pending: PendingWindow<T, BlitzRuntime<T>>,
-        after_window_creation: Option<F>,
-    ) -> tauri_runtime::Result<DetachedWindow<T, BlitzRuntime<T>>> {
-        if current().id() != self.main_thread_id {
-            return Err(Error::FailedToSendMessage);
-        }
-        CURRENT_BLITZ_APPLICATION.with(|current| {
-            let application = current.get();
-            if application.is_null() {
-                return Err(Error::EventLoopClosed);
-            }
-            // The pointer is installed only while Tauri's main-thread callback is running. The
-            // callback does not otherwise borrow the Blitz application, and this runtime clears
-            // the pointer before returning to the event loop.
-            let application =
-                unsafe { &*(application as *const RefCell<BlitzApplication<VelloWindowRenderer>>) };
-            let mut application = application
-                .try_borrow_mut()
-                .map_err(|_| Error::FailedToSendMessage)?;
-            register_window(self, &mut application, pending, after_window_creation)
-        })
-    }
-
-    pub(crate) fn create_webview(
-        &self,
-        _window_id: WindowId,
-        _pending: PendingWebview<T, BlitzRuntime<T>>,
-    ) -> tauri_runtime::Result<DetachedWebview<T, BlitzRuntime<T>>> {
-        Err(Error::CreateWindow)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BlitzEventLoopProxy<T: UserEvent> {
-    context: BlitzRuntimeContext<T>,
-}
-
-impl<T: UserEvent> EventLoopProxy<T> for BlitzEventLoopProxy<T> {
-    fn send_event(&self, event: T) -> tauri_runtime::Result<()> {
-        self.context.send(RuntimeMessage::UserEvent(event))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BlitzRuntimeHandle<T: UserEvent> {
-    context: BlitzRuntimeContext<T>,
-}
-
-impl<T: UserEvent> RuntimeHandle<T> for BlitzRuntimeHandle<T> {
-    type Runtime = BlitzRuntime<T>;
-
-    fn create_proxy(&self) -> BlitzEventLoopProxy<T> {
-        BlitzEventLoopProxy {
-            context: self.context.clone(),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn set_activation_policy(
-        &self,
-        _activation_policy: tauri_runtime::ActivationPolicy,
-    ) -> tauri_runtime::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn set_dock_visibility(&self, _visible: bool) -> tauri_runtime::Result<()> {
-        Ok(())
-    }
-
-    fn request_exit(&self, code: i32) -> tauri_runtime::Result<()> {
-        runtime_trace("runtime exit requested");
-        let result = self.context.send(RuntimeMessage::RequestExit(code));
-        runtime_trace("runtime exit request enqueued");
-        result
-    }
-
-    fn create_window<F: Fn(RawWindow) + Send + 'static>(
-        &self,
-        pending: PendingWindow<T, Self::Runtime>,
-        after_window_creation: Option<F>,
-    ) -> tauri_runtime::Result<DetachedWindow<T, Self::Runtime>> {
-        self.context.create_window(pending, after_window_creation)
-    }
-
-    fn create_webview(
-        &self,
-        window_id: WindowId,
-        pending: PendingWebview<T, Self::Runtime>,
-    ) -> tauri_runtime::Result<DetachedWebview<T, Self::Runtime>> {
-        self.context.create_webview(window_id, pending)
-    }
-
-    fn run_on_main_thread<F: FnOnce() + Send + 'static>(
-        &self,
-        task: F,
-    ) -> tauri_runtime::Result<()> {
-        self.context.run_on_main_thread(task)
-    }
-
-    fn display_handle(
-        &self,
-    ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
-    {
-        Err(raw_window_handle::HandleError::NotSupported)
-    }
-
-    fn primary_monitor(&self) -> tauri_runtime::Result<Option<Monitor>> {
-        Ok(None)
-    }
-
-    fn monitor_from_point(&self, _x: f64, _y: f64) -> tauri_runtime::Result<Option<Monitor>> {
-        Ok(None)
-    }
-
-    fn available_monitors(&self) -> tauri_runtime::Result<Vec<Monitor>> {
-        Ok(Vec::new())
-    }
-
-    fn cursor_position(&self) -> tauri_runtime::Result<PhysicalPosition<f64>> {
-        Err(Error::FailedToGetCursorPosition)
-    }
-
-    fn set_theme(&self, _theme: Option<Theme>) {}
-
-    #[cfg(target_os = "macos")]
-    fn show(&self) -> tauri_runtime::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn hide(&self) -> tauri_runtime::Result<()> {
-        Ok(())
-    }
-
-    fn set_device_event_filter(&self, _filter: DeviceEventFilter) {}
-
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn fetch_data_store_identifiers<F: FnOnce(Vec<[u8; 16]>) + Send + 'static>(
-        &self,
-        _callback: F,
-    ) -> tauri_runtime::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn remove_data_store<F: FnOnce(tauri_runtime::Result<()>) + Send + 'static>(
-        &self,
-        _uuid: [u8; 16],
-        _callback: F,
-    ) -> tauri_runtime::Result<()> {
-        Ok(())
-    }
-}
-
-struct RuntimeApplication<T: UserEvent> {
+struct RuntimeApplication {
     blitz: RefCell<BlitzApplication<VelloWindowRenderer>>,
-    receiver: Receiver<RuntimeMessage<T>>,
-    callback: Option<Box<dyn FnMut(RunEvent<T>)>>,
+    app: App,
+    setup_result: Arc<Mutex<Option<AppResult>>>,
+    #[cfg(all(feature = "agent-control", unix))]
+    receiver: Receiver<RuntimeMessage>,
     ready: bool,
     #[cfg(all(feature = "agent-control", unix))]
     _agent_control: Arc<Mutex<AgentControlRuntime>>,
@@ -561,12 +272,7 @@ struct RuntimeApplication<T: UserEvent> {
     control_events: Arc<Latest<DebugEvent>>,
 }
 
-impl<T: UserEvent> RuntimeApplication<T> {
-    fn emit(&mut self, event: RunEvent<T>) {
-        if let Some(callback) = &mut self.callback {
-            callback(event);
-        }
-    }
+impl RuntimeApplication {
 
     #[cfg(all(feature = "diagnostics", unix))]
     fn agent_document(&mut self) -> Option<&mut ScriptDocument> {
@@ -697,7 +403,7 @@ impl<T: UserEvent> RuntimeApplication<T> {
     }
 }
 
-impl<T: UserEvent> RuntimeApplication<T> {
+impl RuntimeApplication {
     #[cfg(all(feature = "diagnostics", unix))]
     fn collect_diagnostics(
         &mut self,
@@ -712,31 +418,14 @@ impl<T: UserEvent> RuntimeApplication<T> {
     }
 }
 
-impl<T: UserEvent> RuntimeApplication<T> {
+#[cfg(all(feature = "agent-control", unix))]
+impl RuntimeApplication {
     fn drain_runtime_messages(&mut self, event_loop: &dyn ActiveEventLoop) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
-                RuntimeMessage::Task(task) => task(),
-                RuntimeMessage::UserEvent(event) => self.emit(RunEvent::UserEvent(event)),
-                RuntimeMessage::RequestExit(code) => {
-                    runtime_trace("runtime exit request draining");
-                    self.emit(RunEvent::ExitRequested {
-                        code: Some(code),
-                        tx: channel().0,
-                    });
-                    self.emit(RunEvent::Exit);
-                    event_loop.exit();
-                    runtime_trace("native event loop exit flagged");
-                }
-                #[cfg(all(feature = "agent-control", unix))]
                 RuntimeMessage::Control { request, response } => {
                     let result = match request {
                         ControlBridgeRequest::Agent(AgentControlRequest::Quit) => {
-                            self.emit(RunEvent::ExitRequested {
-                                code: Some(0),
-                                tx: channel().0,
-                            });
-                            self.emit(RunEvent::Exit);
                             event_loop.exit();
                             DebugResponse::Ack
                         }
@@ -745,11 +434,6 @@ impl<T: UserEvent> RuntimeApplication<T> {
                                 blitz_control_protocol::lifecycle::lifecycle_handler().is_some();
                             let result = self.handle_builtin_agent(AgentControlRequest::Relaunch);
                             if !delegated && matches!(result, DebugResponse::Ack) {
-                                self.emit(RunEvent::ExitRequested {
-                                    code: Some(0),
-                                    tx: channel().0,
-                                });
-                                self.emit(RunEvent::Exit);
                                 event_loop.exit();
                             }
                             result
@@ -790,7 +474,7 @@ impl<T: UserEvent> RuntimeApplication<T> {
     }
 }
 
-impl<T: UserEvent> ApplicationHandler for RuntimeApplication<T> {
+impl ApplicationHandler for RuntimeApplication {
     #[cfg(target_os = "macos")]
     fn macos_handler(&mut self) -> Option<&mut dyn ApplicationHandlerExtMacOS> {
         Some(self)
@@ -798,15 +482,18 @@ impl<T: UserEvent> ApplicationHandler for RuntimeApplication<T> {
 
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         runtime_trace("runtime can_create_surfaces entered");
+        if event_loop.exiting() {
+            return;
+        }
         if !self.ready {
             self.ready = true;
-            CURRENT_BLITZ_APPLICATION.with(|current| {
-                current.set(&self.blitz as *const _ as *const ());
-                let _guard = CurrentApplicationGuard;
-                runtime_trace("Tauri Ready emission started");
-                self.emit(RunEvent::Ready);
-                runtime_trace("Tauri Ready emission completed");
-            });
+            runtime_trace("application setup started");
+            if let Err(error) = self.app.run_setup() {
+                *self.setup_result.lock().unwrap() = Some(Err(error));
+                event_loop.exit();
+                return;
+            }
+            runtime_trace("application setup completed");
         }
         self.blitz.get_mut().can_create_surfaces(event_loop);
         runtime_trace("runtime can_create_surfaces completed");
@@ -819,7 +506,6 @@ impl<T: UserEvent> ApplicationHandler for RuntimeApplication<T> {
     fn resumed(&mut self, event_loop: &dyn ActiveEventLoop) {
         runtime_trace("runtime resumed entered");
         self.blitz.get_mut().resumed(event_loop);
-        self.emit(RunEvent::Resumed);
         runtime_trace("runtime resumed completed");
     }
 
@@ -848,9 +534,9 @@ impl<T: UserEvent> ApplicationHandler for RuntimeApplication<T> {
     }
 
     fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
-        // Embedder messages own the runtime lifecycle, so they run before
-        // renderer wake work. In particular an exit request must not return to
-        // AppKit's wait loop after a renderer callback consumed the wake.
+        // Control requests run before renderer wake work so an exit request
+        // cannot be swallowed by a renderer callback.
+        #[cfg(all(feature = "agent-control", unix))]
         self.drain_runtime_messages(event_loop);
         if event_loop.exiting() {
             return;
@@ -859,14 +545,17 @@ impl<T: UserEvent> ApplicationHandler for RuntimeApplication<T> {
     }
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        #[cfg(all(feature = "agent-control", unix))]
         self.drain_runtime_messages(event_loop);
-        self.emit(RunEvent::MainEventsCleared);
+        if event_loop.exiting() {
+            return;
+        }
         self.blitz.get_mut().about_to_wait(event_loop);
     }
 }
 
 #[cfg(target_os = "macos")]
-impl<T: UserEvent> ApplicationHandlerExtMacOS for RuntimeApplication<T> {
+impl ApplicationHandlerExtMacOS for RuntimeApplication {
     fn standard_key_binding(
         &mut self,
         event_loop: &dyn ActiveEventLoop,
@@ -879,230 +568,114 @@ impl<T: UserEvent> ApplicationHandlerExtMacOS for RuntimeApplication<T> {
     }
 }
 
-pub struct BlitzRuntime<T: UserEvent = tauri::EventLoopMessage> {
-    event_loop: winit::event_loop::EventLoop,
-    application: RefCell<Option<RuntimeApplication<T>>>,
-    context: BlitzRuntimeContext<T>,
-}
-
-impl<T: UserEvent> fmt::Debug for BlitzRuntime<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("BlitzRuntime")
-            .field("context", &self.context)
-            .finish()
-    }
-}
-
-impl<T: UserEvent> BlitzRuntime<T> {
-    fn prepared_webview(
-        pending: PendingWebview<T, Self>,
-    ) -> tauri_runtime::Result<PreparedBlitzWebview<T, Self>> {
-        let document = create_document(&pending.url)?;
-        Ok(prepare_pending_webview(pending, document))
-    }
-}
-
-impl<T: UserEvent> Runtime<T> for BlitzRuntime<T> {
-    type WindowDispatcher = BlitzWindowDispatcher<T>;
-    type WebviewDispatcher = BlitzWebviewDispatcher<T, Self>;
-    type Handle = BlitzRuntimeHandle<T>;
-    type EventLoopProxy = BlitzEventLoopProxy<T>;
-
-    fn new(_args: RuntimeInitArgs) -> tauri_runtime::Result<Self> {
-        runtime_trace("BlitzRuntime::new entered");
-        runtime_trace("native event-loop construction started");
-        let event_loop = create_default_event_loop();
-        runtime_trace("native event-loop construction completed");
-        let (proxy, blitz_receiver) = BlitzShellProxy::new(event_loop.create_proxy());
-        let (sender, receiver) = channel();
-        let context = BlitzRuntimeContext {
-            sender,
-            proxy: proxy.clone(),
-            next_window_id: Arc::new(AtomicU32::new(1)),
-            next_window_event_id: Arc::new(AtomicU32::new(1)),
-            windows: Arc::new(Mutex::new(HashMap::new())),
-            main_thread_id: current().id(),
-        };
-        #[cfg(all(feature = "agent-control", unix))]
-        let (agent_control, control_events) = {
-            let control_context = context.clone();
-            let bridge: ControlBridge = Arc::new(move |request| {
-                let response = Once::new();
-                let receiver = Arc::clone(&response);
-                let _ = control_context.send(RuntimeMessage::Control { request, response });
-                receiver
-            });
-            // A watch channel retains only the newest revision. Inspection is
-            // therefore bounded even when a client stalls or an animation
-            // presents much faster than the client can consume notifications.
-            let event_sender = Latest::new();
-            let event_receiver = Arc::clone(&event_sender);
-            // The embedder's persisted control state is applied later during Tauri
-            // setup. This enable-only rescue must start earlier: when control
-            // was switched off, setup is unreachable to the very automation
-            // needed to switch it back on. It also lets QA attach while a large
-            // application is still booting.
-            let server = if std::env::args().any(|arg| arg == "--blitz-control") {
-                Some(
-                    AgentControlServer::start_with_events(
-                        bridge.clone(),
-                        Host {
-                            name: env!("CARGO_PKG_NAME").into(),
-                            version: env!("CARGO_PKG_VERSION").into(),
-                            diagnostics: cfg!(feature = "diagnostics"),
-                        },
-                        event_receiver,
-                    )
-                    .map_err(|error| Error::CreateWebview(Box::new(error)))?,
-                )
-            } else {
-                None
-            };
-            let runtime = Arc::new(Mutex::new(AgentControlRuntime {
-                bridge,
-                events: event_sender.clone(),
-                server,
-            }));
-            *AGENT_CONTROL_RUNTIME
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .unwrap() = Some(Arc::downgrade(&runtime));
-            (runtime, event_sender)
-        };
-        let blitz = BlitzApplication::new(proxy, blitz_receiver);
-        #[cfg(feature = "debug-control")]
-        let mut blitz = blitz;
-        #[cfg(feature = "debug-control")]
-        if let Some(mut controller) =
-            blitz_script::DebugController::start_from_env(env!("CARGO_PKG_VERSION"))
-                .map_err(|error| Error::CreateWebview(Box::new(error)))?
+impl Drop for RuntimeApplication {
+    fn drop(&mut self) {
+        self.app.handle().clear_native_window();
+        #[cfg(target_os = "macos")]
         {
-            let (width, height) = debug_screenshot_size_from_env().unwrap_or((1344, 932));
-            controller = controller.with_cpu_screenshot(width, height);
-            blitz.set_debug_controller(controller);
+            if let Some(slot) = NATIVE_WINDOW.get() {
+                slot.lock().unwrap().take();
+            }
+            NATIVE_SURFACE_TRANSPARENT.store(false, Ordering::Release);
         }
-        let application = RuntimeApplication {
-            blitz: RefCell::new(blitz),
-            receiver,
-            callback: None,
-            ready: false,
-            #[cfg(all(feature = "agent-control", unix))]
-            _agent_control: agent_control,
-            #[cfg(all(feature = "agent-control", unix))]
-            control: DocumentControl::new(),
-            #[cfg(all(feature = "agent-control", unix))]
-            paint_revision: 0,
-            #[cfg(all(feature = "agent-control", unix))]
-            control_events,
+    }
+}
+
+/// Create one chrome window and run the native loop on the calling thread.
+pub(crate) fn run(app: App) -> AppResult {
+    runtime_trace("application run entered");
+    runtime_trace("native event-loop construction started");
+    let event_loop = create_default_event_loop();
+    runtime_trace("native event-loop construction completed");
+    let (proxy, blitz_receiver) = BlitzShellProxy::new(event_loop.create_proxy());
+    #[cfg(all(feature = "agent-control", unix))]
+    let (sender, receiver) = channel();
+    #[cfg(all(feature = "agent-control", unix))]
+    let (agent_control, control_events) = {
+        let control_proxy = proxy.clone();
+        let bridge: ControlBridge = Arc::new(move |request| {
+            let response = Once::new();
+            let receiver = Arc::clone(&response);
+            if sender
+                .send(RuntimeMessage::Control { request, response })
+                .is_err()
+            {
+                receiver.fill(DebugResponse::Error(DebugError {
+                    code: "runtimeUnavailable".into(),
+                    message: "the native event loop has stopped".into(),
+                }));
+            } else {
+                control_proxy.wake_up();
+            }
+            receiver
+        });
+        // A watch channel retains only the newest revision. Inspection is
+        // therefore bounded even when a client stalls or an animation
+        // presents much faster than the client can consume notifications.
+        let event_sender = Latest::new();
+        let event_receiver = Arc::clone(&event_sender);
+        // The embedder's persisted control state is applied during setup.
+        // The CLI rescue starts earlier so QA can attach during startup.
+        let server = if std::env::args().any(|arg| arg == "--blitz-control") {
+            Some(AgentControlServer::start_with_events(
+                bridge.clone(),
+                Host {
+                    name: env!("CARGO_PKG_NAME").into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    diagnostics: cfg!(feature = "diagnostics"),
+                },
+                event_receiver,
+            )?)
+        } else {
+            None
         };
-        runtime_trace("BlitzRuntime::new completed");
-        Ok(Self {
-            event_loop,
-            application: RefCell::new(Some(application)),
-            context,
-        })
+        let runtime = Arc::new(Mutex::new(AgentControlRuntime {
+            bridge,
+            events: event_sender.clone(),
+            server,
+        }));
+        *AGENT_CONTROL_RUNTIME
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(Arc::downgrade(&runtime));
+        (runtime, event_sender)
+    };
+    let mut blitz = BlitzApplication::new(proxy, blitz_receiver);
+    #[cfg(feature = "debug-control")]
+    if let Some(mut controller) =
+        blitz_script::DebugController::start_from_env(env!("CARGO_PKG_VERSION"))?
+    {
+        let (width, height) = debug_screenshot_size_from_env().unwrap_or((1344, 932));
+        controller = controller.with_cpu_screenshot(width, height);
+        blitz.set_debug_controller(controller);
     }
-
-    fn create_proxy(&self) -> Self::EventLoopProxy {
-        BlitzEventLoopProxy {
-            context: self.context.clone(),
-        }
+    let handle = app.handle();
+    register_window(&handle, &mut blitz, app.window_spec())?;
+    let setup_result = Arc::new(Mutex::new(None));
+    let application = RuntimeApplication {
+        blitz: RefCell::new(blitz),
+        app,
+        setup_result: Arc::clone(&setup_result),
+        #[cfg(all(feature = "agent-control", unix))]
+        receiver,
+        ready: false,
+        #[cfg(all(feature = "agent-control", unix))]
+        _agent_control: agent_control,
+        #[cfg(all(feature = "agent-control", unix))]
+        control: DocumentControl::new(),
+        #[cfg(all(feature = "agent-control", unix))]
+        paint_revision: 0,
+        #[cfg(all(feature = "agent-control", unix))]
+        control_events,
+    };
+    runtime_trace("native event loop run_app started");
+    let loop_result = event_loop.run_app(application);
+    runtime_trace("native event loop run_app returned");
+    if let Some(result) = setup_result.lock().unwrap().take() {
+        result?;
     }
-
-    fn handle(&self) -> Self::Handle {
-        BlitzRuntimeHandle {
-            context: self.context.clone(),
-        }
-    }
-
-    fn create_window<F: Fn(RawWindow) + Send + 'static>(
-        &self,
-        pending: PendingWindow<T, Self>,
-        after_window_creation: Option<F>,
-    ) -> tauri_runtime::Result<DetachedWindow<T, Self>> {
-        let mut application = self.application.borrow_mut();
-        let application = application.as_mut().ok_or(Error::EventLoopClosed)?;
-        register_window(
-            &self.context,
-            application.blitz.get_mut(),
-            pending,
-            after_window_creation,
-        )
-    }
-
-    fn create_webview(
-        &self,
-        _window_id: WindowId,
-        _pending: PendingWebview<T, Self>,
-    ) -> tauri_runtime::Result<DetachedWebview<T, Self>> {
-        Err(Error::CreateWindow)
-    }
-
-    fn primary_monitor(&self) -> Option<Monitor> {
-        None
-    }
-
-    fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<Monitor> {
-        None
-    }
-
-    fn available_monitors(&self) -> Vec<Monitor> {
-        Vec::new()
-    }
-
-    fn cursor_position(&self) -> tauri_runtime::Result<PhysicalPosition<f64>> {
-        Err(Error::FailedToGetCursorPosition)
-    }
-
-    fn set_theme(&self, _theme: Option<Theme>) {}
-
-    #[cfg(target_os = "macos")]
-    fn set_activation_policy(&mut self, _activation_policy: tauri_runtime::ActivationPolicy) {}
-
-    #[cfg(target_os = "macos")]
-    fn set_activate_ignoring_other_apps(&mut self, _ignore: bool) {}
-
-    #[cfg(target_os = "macos")]
-    fn set_dock_visibility(&mut self, _visible: bool) {}
-
-    #[cfg(target_os = "macos")]
-    fn show(&self) {}
-
-    #[cfg(target_os = "macos")]
-    fn hide(&self) {}
-
-    fn set_device_event_filter(&mut self, _filter: DeviceEventFilter) {}
-
-    #[cfg(any(
-        target_os = "macos",
-        windows,
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))]
-    fn run_iteration<F: FnMut(RunEvent<T>) + 'static>(&mut self, _callback: F) {}
-
-    fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
-        self.run(callback);
-        0
-    }
-
-    fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) {
-        runtime_trace("BlitzRuntime::run entered");
-        let mut application = self
-            .application
-            .into_inner()
-            .expect("Blitz runtime application already consumed");
-        application.callback = Some(Box::new(callback));
-        runtime_trace("native event loop run_app started");
-        if let Err(error) = self.event_loop.run_app(application) {
-            eprintln!("izumo: event loop failed: {error}");
-        }
-        runtime_trace("native event loop run_app returned");
-    }
+    loop_result?;
+    Ok(())
 }
 
 #[cfg(all(feature = "agent-control", unix))]
@@ -1141,57 +714,35 @@ fn debug_screenshot_size_from_env() -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
-/// Create a Tauri builder configured for the Blitz runtime.
-pub fn builder() -> tauri::Builder<BlitzRuntime> {
-    let builder = tauri::Builder::new();
-    #[cfg(target_os = "macos")]
-    let builder = builder.enable_macos_default_menu(false);
-    builder
-}
-
-fn register_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
-    context: &BlitzRuntimeContext<T>,
+fn register_window(
+    handle: &AppHandle,
     application: &mut BlitzApplication<VelloWindowRenderer>,
-    pending: PendingWindow<T, BlitzRuntime<T>>,
-    after_window_creation: Option<F>,
-) -> tauri_runtime::Result<DetachedWindow<T, BlitzRuntime<T>>> {
+    config: WindowSpec,
+) -> AppResult {
     runtime_trace("native window registration entered");
-    let id = context.next_window_id();
-    let label = pending.label;
-    let builder = pending.window_builder;
-    let pending_webview = pending.webview.ok_or(Error::CreateWindow)?;
-    let prepared = BlitzRuntime::<T>::prepared_webview(pending_webview)?;
-    let use_https_scheme = prepared.pending.webview_attributes.use_https_scheme;
+    let mut document = create_document(&config.url)?;
+    handle.script_queue().attach_to(&mut document);
+    attach_ipc_handler(&mut document, handle.clone());
 
-    let state = Arc::new(NativeWindowState {
-        label: label.clone(),
-        config: Mutex::new(builder.config.clone()),
-        native: Mutex::new(None),
-        event_handlers: Mutex::new(HashMap::new()),
-    });
-    context
-        .windows
-        .lock()
-        .unwrap()
-        .insert(id, Arc::clone(&state));
-
-    let attributes = window_attributes(&builder);
-    let state_for_creation = Arc::clone(&state);
-    // A transparent window needs the surface to composite that way and the
-    // frame to be cleared to nothing. The renderer's default clear colour is
-    // opaque white, so leaving it alone would hand the compositor a filled
-    // frame and the glass behind it would never be visible — the same black
-    // window that a missing `with_transparent` produces, from a different
-    // cause.
+    let attributes = window_attributes(&config);
+    let handle_for_creation = handle.clone();
+    let background_color = config
+        .background_color
+        .map(|[red, green, blue, alpha]| peniko::Color::from_rgba8(red, green, blue, alpha))
+        .unwrap_or(peniko::Color::WHITE);
+    // A transparent window needs transparent surface compositing and a clear
+    // frame. An opaque window uses the embedder's background color.
     #[cfg(not(feature = "hybrid-renderer"))]
-    let renderer = if builder.config.transparent {
+    let renderer = if config.transparent {
         VelloWindowRenderer::with_options(
             anyrender_vello::VelloRendererOptions::default()
                 .composite_alpha_mode(anyrender::CompositeAlphaMode::Transparent)
                 .base_color(peniko::Color::TRANSPARENT),
         )
     } else {
-        VelloWindowRenderer::new()
+        VelloWindowRenderer::with_options(
+            anyrender_vello::VelloRendererOptions::default().base_color(background_color),
+        )
     };
     // The hybrid pipeline, same decision through its own options type.
     //
@@ -1200,63 +751,37 @@ fn register_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
     // intermediate texture and applies the filter there. Classic vello has no
     // filter parameter at all, so a build that wants `filter:` wants this one.
     #[cfg(feature = "hybrid-renderer")]
-    let renderer = if builder.config.transparent {
+    let renderer = if config.transparent {
         VelloWindowRenderer::with_options(
             anyrender_vello_hybrid::VelloHybridRendererOptions::default()
                 .composite_alpha_mode(anyrender::CompositeAlphaMode::Transparent)
                 .base_color(peniko::Color::TRANSPARENT),
         )
     } else {
-        VelloWindowRenderer::new()
+        VelloWindowRenderer::with_options(
+            anyrender_vello_hybrid::VelloHybridRendererOptions::default()
+                .base_color(background_color),
+        )
     };
     let window =
-        BlitzShellWindowConfig::with_attributes(Box::new(prepared.document), renderer, attributes)
+        BlitzShellWindowConfig::with_attributes(Box::new(document), renderer, attributes)
             .with_on_created(move |native| {
-                /*
-                 * The attributes above were snapshotted at registration, but the native
-                 * window is not created until the event loop can make surfaces, and
-                 * Tauri's `setup` runs in between. A `show()` in there reaches the
-                 * config and finds no native window to forward to, so replaying the
-                 * current visibility here is what makes it take effect. Without this a
-                 * window configured `visible: false` and shown once the app is ready,
-                 * which is the standard way to hide a slow boot, stays hidden forever.
-                 */
-                let visible = state_for_creation.config.lock().unwrap().visible;
-                native.set_visible(visible);
+                // Setup runs after attributes were snapshotted. Binding replays
+                // the current visibility, including show() on a hidden window.
                 #[cfg(target_os = "macos")]
                 {
-                    // A small generic escape hatch for platform integrations owned by
-                    // the embedder. TRB stores the native window; it does not know what
-                    // effect or application policy the callback applies.
                     let slot = NATIVE_WINDOW.get_or_init(|| Mutex::new(None));
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some(Arc::clone(&native));
                     }
                 }
-                *state_for_creation.native.lock().unwrap() = Some(native);
-                if let Some(callback) = after_window_creation {
-                    let marker = PhantomData;
-                    callback(RawWindow { _marker: &marker });
-                }
+                handle_for_creation.bind_native_window(native);
             });
     #[cfg(target_os = "macos")]
-    NATIVE_SURFACE_TRANSPARENT.store(builder.config.transparent, Ordering::Release);
+    NATIVE_SURFACE_TRANSPARENT.store(config.transparent, Ordering::Release);
     application.add_window(window);
     runtime_trace("native window queued");
-
-    Ok(DetachedWindow {
-        id,
-        label,
-        dispatcher: BlitzWindowDispatcher {
-            id,
-            context: context.clone(),
-            state,
-        },
-        webview: Some(DetachedWindowWebview {
-            webview: prepared.detached,
-            use_https_scheme,
-        }),
-    })
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1295,8 +820,7 @@ pub(crate) fn with_native_window(callback: impl FnOnce(&dyn winit::window::Windo
     true
 }
 
-fn window_attributes(builder: &BlitzWindowBuilder) -> WindowAttributes {
-    let config = &builder.config;
+fn window_attributes(config: &WindowSpec) -> WindowAttributes {
     let mut attributes = WindowAttributes::default()
         .with_title(config.title.clone())
         .with_surface_size(LogicalSize::new(config.width, config.height))
@@ -1305,12 +829,10 @@ fn window_attributes(builder: &BlitzWindowBuilder) -> WindowAttributes {
         .with_visible(config.visible)
         .with_decorations(config.decorations)
         .with_content_protected(config.content_protected)
-        // Was accepted by the builder, stored on the config, and never read, so
-        // `"transparent": true` was a silent no-op and nothing behind the window
-        // could ever show through. It is the first of the three things a glass
-        // window needs; the other two are a non-opaque composite mode and a root
-        // that does not paint over everything.
+        // Surface compositing and the renderer's clear color must agree.
         .with_transparent(config.transparent)
+        .with_theme(config.theme)
+        .with_focusable(config.focusable)
         .with_active(config.focus);
 
     if let (Some(x), Some(y)) = (config.x, config.y) {
@@ -1346,17 +868,16 @@ fn window_attributes(builder: &BlitzWindowBuilder) -> WindowAttributes {
     #[cfg(target_os = "macos")]
     {
         let macos_attributes = match config.title_bar_style {
-            tauri_utils::TitleBarStyle::Visible => {
+            TitleBarStyle::Visible => {
                 WindowAttributesMacOS::default().with_title_hidden(config.hidden_title)
             }
-            tauri_utils::TitleBarStyle::Transparent => WindowAttributesMacOS::default()
+            TitleBarStyle::Transparent => WindowAttributesMacOS::default()
                 .with_titlebar_transparent(true)
                 .with_title_hidden(config.hidden_title),
-            tauri_utils::TitleBarStyle::Overlay => WindowAttributesMacOS::default()
+            TitleBarStyle::Overlay => WindowAttributesMacOS::default()
                 .with_titlebar_transparent(true)
                 .with_title_hidden(config.hidden_title)
                 .with_fullsize_content_view(true),
-            _ => WindowAttributesMacOS::default().with_title_hidden(config.hidden_title),
         };
         attributes = attributes.with_platform_attributes(Box::new(macos_attributes));
     }
@@ -1371,158 +892,3 @@ fn window_attributes(builder: &BlitzWindowBuilder) -> WindowAttributes {
     attributes
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use blitz_dom::DocumentConfig;
-    use tauri_runtime::window::WindowBuilder;
-
-    #[test]
-    fn document_factory_receives_pending_url() {
-        set_document_factory(|url| {
-            Ok(ScriptDocument::from_html(
-                "<div id='ready'>ready</div>",
-                DocumentConfig {
-                    base_url: Some(url.into()),
-                    ..DocumentConfig::default()
-                },
-            ))
-        });
-
-        let document = create_document("tauri://localhost/view").unwrap();
-        assert_eq!(
-            document.current_url().map(url::Url::as_str),
-            Some("tauri://localhost/view")
-        );
-    }
-
-    #[test]
-    fn window_attributes_preserve_initial_native_configuration() {
-        let mut builder = BlitzWindowBuilder::new();
-        builder.config.title = "Example application".into();
-        builder.config.width = 640.0;
-        builder.config.height = 480.0;
-        builder.config.min_width = Some(320.0);
-        builder.config.min_height = Some(240.0);
-        builder.config.visible = false;
-        builder.config.decorations = false;
-
-        let attributes = window_attributes(&builder);
-        assert_eq!(attributes.title, "Example application");
-        assert_eq!(
-            attributes.surface_size,
-            Some(LogicalSize::new(640.0, 480.0).into())
-        );
-        assert_eq!(
-            attributes.min_surface_size,
-            Some(LogicalSize::new(320.0, 240.0).into())
-        );
-        assert!(!attributes.visible);
-        assert!(!attributes.decorations);
-    }
-
-    #[cfg(all(feature = "agent-control", unix))]
-    #[test]
-    fn control_interface_is_absent_until_explicitly_enabled() {
-        nagoya::block_on(async {
-            let _guard = CONTROL_TEST_LOCK.write().await;
-            let bridge: ControlBridge = Arc::new(|_| {
-                let sender = Once::new();
-                let receiver = Arc::clone(&sender);
-                sender.fill(DebugResponse::Ack);
-                receiver
-            });
-            let events = Latest::new();
-            let runtime = Arc::new(Mutex::new(AgentControlRuntime {
-                bridge,
-                events,
-                server: None,
-            }));
-            *AGENT_CONTROL_RUNTIME
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .unwrap() = Some(Arc::downgrade(&runtime));
-
-            assert!(!agent_control_enabled());
-            apply_runtime_debug_options(blitz_traits::profiling::DebugOptions {
-                inspection_and_agent_control: true,
-                deep_intrusive_profiling: false,
-            })
-            .unwrap();
-            assert!(agent_control_enabled());
-            assert!(!deep_profiling_enabled());
-
-            // Enabling profiling after the listener already exists must attach a
-            // consumer to that same server. AZ starts in exactly this order when
-            // its runtime constructs before persisted/CLI debug options are read.
-            apply_runtime_debug_options(blitz_traits::profiling::DebugOptions {
-                inspection_and_agent_control: true,
-                deep_intrusive_profiling: true,
-            })
-            .unwrap();
-            assert!(
-                deep_profiling_permitted(),
-                "the embedder's switch is permission, and it was just granted"
-            );
-            // Permission plus a consumer. The control server holds a session for
-            // the out-of-process tool that can now attach, so collection is running
-            // here even though nothing in this process reads a sample.
-            assert!(
-                deep_profiling_enabled(),
-                "a listening control server is the consumer that starts collection"
-            );
-
-            // The two switches are independent, and this is the case that proves
-            // it: inspection off, profiling still permitted.
-            //
-            // This once asserted the opposite, on the reasoning that samples are
-            // only useful while a socket exists to read them back. ps-blitz
-            // e47684f4 removed that AND deliberately, because ANDing made the
-            // embedder's profiling toggle silently inert whenever inspection was
-            // off: turning inspection off and on again lost the setting entirely.
-            apply_runtime_debug_options(blitz_traits::profiling::DebugOptions {
-                inspection_and_agent_control: false,
-                deep_intrusive_profiling: true,
-            })
-            .unwrap();
-            assert!(!agent_control_enabled());
-            assert!(
-                deep_profiling_permitted(),
-                "deep profiling answers for itself; inspection must not withdraw permission"
-            );
-            // But collection stops, because closing the server dropped the only
-            // consumer. That is the point of the change rather than a regression:
-            // with no tool able to attach, the samples had no reader.
-            assert!(
-                !deep_profiling_enabled(),
-                "no consumer can attach, so nothing should still be collecting"
-            );
-
-            // Left off, because it is process-global and the next test in this
-            // binary starts wherever this one stops.
-            apply_runtime_debug_options(blitz_traits::profiling::DebugOptions::default()).unwrap();
-            assert!(!deep_profiling_permitted());
-            assert!(!deep_profiling_enabled());
-        });
-    }
-
-    #[cfg(all(feature = "agent-control", target_os = "macos"))]
-    #[test]
-    fn relaunch_uses_the_app_bundle_instead_of_the_inner_macos_binary() {
-        let executable = std::path::Path::new("/Applications/Example.app/Contents/MacOS/example");
-        assert_eq!(
-            containing_app_bundle(executable).as_deref(),
-            Some(std::path::Path::new("/Applications/Example.app"))
-        );
-        assert_eq!(
-            containing_app_bundle(std::path::Path::new(
-                "/Applications/Example.app/Contents/Resources/helper"
-            )),
-            None
-        );
-        assert_eq!(
-            containing_app_bundle(std::path::Path::new("/tmp/example")),
-            None
-        );
-    }
-}
