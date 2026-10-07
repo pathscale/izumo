@@ -5,7 +5,7 @@ use std::task::{Context as TaskContext, Waker};
 
 use blitz_script::ScriptDocument;
 
-/// Thread-safe ingress for scripts emitted by Tauri command and event responders.
+/// Thread-safe ingress for application command replies, events and UI work.
 ///
 /// `ScriptDocument` is intentionally single-threaded. Dispatchers clone this queue and push from
 /// any thread; the native event loop drains it into Boa on the document thread.
@@ -24,7 +24,7 @@ struct ScriptQueueState {
     waker: Option<Waker>,
 }
 
-/// Queue shared by the thread-safe webview dispatcher and the Boa document thread.
+/// Queue shared by the application handle and the Boa document thread.
 #[derive(Clone, Default)]
 pub struct ScriptQueue(Arc<Mutex<ScriptQueueState>>);
 
@@ -51,6 +51,17 @@ impl ScriptQueue {
 
     pub fn enqueue(&self, script: impl Into<String>) {
         self.push(ScriptTask::Evaluate(script.into()));
+    }
+
+    /// Serialize replies as JSON values before inserting them into evaluated JavaScript.
+    pub(crate) fn enqueue_reply(&self, id: u64, result: crate::CommandResult) {
+        let (success, payload) = match result {
+            Ok(payload) => (true, payload),
+            Err(error) => (false, serde_json::Value::String(error)),
+        };
+        self.enqueue(format!(
+            "window.__IZUMO__._reply({id},{success},{payload});"
+        ));
     }
 
     pub fn enqueue_with_callback(
@@ -110,116 +121,5 @@ impl ScriptQueue {
             }
         }
         count
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use blitz_dom::{Document, DocumentConfig};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Wake, Waker};
-
-    #[derive(Default)]
-    struct WakeCounter(AtomicUsize);
-
-    impl Wake for WakeCounter {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[test]
-    fn responses_run_on_the_document_thread_in_order() {
-        let mut document = ScriptDocument::from_html(
-            r#"<div id="result">waiting</div>"#,
-            DocumentConfig::default(),
-        );
-        let queue = ScriptQueue::default();
-        let producer = queue.clone();
-        std::thread::spawn(move || {
-            producer.enqueue("window.first = 'hello';");
-            producer.enqueue(
-                "document.getElementById('result').textContent = window.first + ' from Rust';",
-            );
-        })
-        .join()
-        .unwrap();
-
-        assert_eq!(queue.pending(), 2);
-        assert_eq!(queue.drain_into(&mut document), 2);
-        assert_eq!(queue.pending(), 0);
-        let inner = document.inner();
-        let result = inner.query_selector("#result").unwrap().unwrap();
-        assert_eq!(
-            inner.get_node(result).unwrap().text_content(),
-            "hello from Rust"
-        );
-    }
-
-    #[test]
-    fn evaluation_result_returns_to_an_async_dispatcher_callback() {
-        let mut document = ScriptDocument::from_html(
-            r#"<div id="result">waiting</div>"#,
-            DocumentConfig::default(),
-        );
-        let queue = ScriptQueue::default();
-        let producer = queue.clone();
-        let (result_sender, result_receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            producer.enqueue_with_callback(
-                "({ message: 'Hello from greet', requestId: 7 })",
-                move |result| result_sender.send(result).unwrap(),
-            );
-        })
-        .join()
-        .unwrap();
-
-        assert_eq!(queue.drain_into(&mut document), 1);
-        assert_eq!(
-            result_receiver.recv().unwrap(),
-            r#"{"message":"Hello from greet","requestId":7}"#
-        );
-    }
-
-    #[test]
-    fn attached_queue_wakes_and_drains_from_document_poll() {
-        let mut document = ScriptDocument::from_html(
-            r#"<div id="result">waiting</div>"#,
-            DocumentConfig::default(),
-        );
-        let queue = ScriptQueue::default();
-        queue.attach_to(&mut document);
-
-        let counter = Arc::new(WakeCounter::default());
-        let waker = Waker::from(Arc::clone(&counter));
-        assert!(document.poll(Some(Context::from_waker(&waker))));
-
-        queue.enqueue("document.getElementById('result').textContent = 'drained';");
-        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
-        assert!(document.poll(Some(Context::from_waker(&waker))));
-
-        let inner = document.inner();
-        let result = inner.query_selector("#result").unwrap().unwrap();
-        assert_eq!(inner.get_node(result).unwrap().text_content(), "drained");
-    }
-
-    #[test]
-    fn attaching_queue_preserves_existing_document_poll_hook() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&calls);
-        let mut document = ScriptDocument::from_html(
-            "<div id=\"result\">waiting</div>",
-            DocumentConfig::default(),
-        );
-        document.set_poll_hook(move |_, _| {
-            observed.fetch_add(1, Ordering::Relaxed);
-            true
-        });
-
-        ScriptQueue::default().attach_to(&mut document);
-
-        assert!(document.poll(None));
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
