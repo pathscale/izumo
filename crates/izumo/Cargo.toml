@@ -1,7 +1,7 @@
 [package]
 name = "izumo"
-description = "Tauri runtime backed by Blitz and Boa"
-version.workspace = true
+description = "Standalone Blitz and Boa application shell"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -39,45 +39,27 @@ blitz-control-protocol = { version = "^0.5", default-features = false, optional 
 anyrender = { package = "ps-anyrender", version = "^0.13" }
 peniko = "0.6"
 
-blitz-shell = { package = "ps-blitz-shell", version = "^0.4", default-features = false, features = ["clipboard", "svg"] }
+blitz-shell = { package = "ps-blitz-shell", version = "^0.4", default-features = false, features = ["clipboard", "svg"], optional = true }
 blitz-traits = { package = "ps-blitz-traits", version = "^0.4", optional = true }
 http = "1"
-# No `endpoint-libs`, `keyboard-types`, `serde` or `serde_json`. They were the
-# wire framing, the key table and the request types of a control surface this
-# crate no longer implements; `blitz-control-protocol` names them now, and a
-# consumer that wants them names it.
+# The control protocol owns endpoint framing and its request types.
+# The application owns JSON command arguments, replies and event payloads,
+# so serialization is a direct dependency here.
+serde = "1"
+serde_json = "1"
 libc = "0.2"
 raw-window-handle = "0.6"
-tauri = { version = "^2", default-features = false, optional = true }
-tauri-runtime = { version = "^2", optional = true }
-tauri-utils = { version = "2", optional = true }
 url = "2"
 winit = "0.31.0-beta.2"
 nagoya = { version = "^0.1", optional = true }
 
 [features]
 default = ["agent-control", "runtime"]
-# The Tauri runtime itself: windows, webviews, the event loop. Everything that
-# needs a window lives behind this.
-#
-# Off, a headless consumer gets the inspection and activation surface with no
-# Tauri in its graph, which on Linux is the difference between a build and GTK
-# development headers for a binary that never opens a window.
-#
-# `anyrender_vello` belongs here too, and did not. `mod runtime` is the only
-# thing that names `VelloWindowRenderer`, and that module is already behind this
-# feature, so the renderer was reachable by exactly the consumers that could
-# never use it. A headless build linked wgpu, two versions of vello, naga and
-# wgpu-hal to serve a socket that reads a semantic tree.
-#
-# Same shape as `system-fonts` sitting in `blitz-dom`'s defaults: the intent was
-# written down in this comment, and nothing enforced it. The graph check below
-# now looks for renderers as well as window stacks.
+# Native windows and the event loop. App and its document-thread ingress live
+# behind this feature; the renderer is enabled only for window consumers.
 runtime = [
-    "dep:tauri",
-    "dep:tauri-runtime",
-    "dep:tauri-utils",
     "dep:anyrender_vello",
+    "dep:blitz-shell",
 ]
 # Serve this runtime's own document over the control socket.
 #
@@ -105,23 +87,9 @@ diagnostics = ["agent-control", "blitz-control-protocol/capture", "debug-control
 # through a compute pass built for arbitrary vector art. The hybrid backend
 # does far less per primitive, which is the same bet GPUI makes.
 hybrid-renderer = ["dep:anyrender_vello_hybrid"]
-devtools = ["runtime", "tauri-runtime/devtools"]
-# Forwarded, not an empty flag. `WindowBuilder::transparent` is declared behind
-# this feature in `tauri-runtime` and implemented behind it here, so enabling it
-# on only one side leaves the impl carrying a method the trait does not declare:
-# "method `transparent` is not a member of trait `WindowBuilder`". An empty
-# feature here meant `--all-features` turned this on without turning it on for
-# `tauri-runtime`, which is exactly that mismatch, and it is why this crate
-# could not be packaged: crates.io verifies with every feature enabled.
-macos-private-api = ["runtime", "tauri/macos-private-api", "tauri-runtime/macos-private-api"]
-
-[dev-dependencies]
-tauri = { version = "^2", default-features = false, features = ["test"] }
-# The IPC round-trip test builds a request body and reads the reply back. It was
-# a dev use of a dependency the crate itself carried for the control protocol,
-# so removing that left the test with no JSON: a test dependency now, which is
-# what it always was.
-serde_json = "1"
+# Retained feature names for embedders selecting native shell capabilities.
+devtools = ["runtime"]
+macos-private-api = ["runtime"]
 
 # Only on macOS, and only for the one test that needs a face:
 # `setting_a_node_value_replaces_text_and_dispatches_input`. Replacing a
