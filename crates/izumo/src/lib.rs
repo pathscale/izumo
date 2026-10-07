@@ -26,6 +26,10 @@ pub use app::{
     WindowSpec,
 };
 #[cfg(feature = "runtime")]
+mod menu;
+#[cfg(feature = "runtime")]
+pub use menu::{menu_id, MenuBar};
+#[cfg(feature = "runtime")]
 mod ipc;
 #[cfg(feature = "runtime")]
 pub use ipc::attach_ipc_handler;
