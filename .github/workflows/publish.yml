@@ -1,12 +1,7 @@
 name: Publish crates
 
+# Manual only; releases are normally published locally after the merge.
 on:
-  push:
-    branches: [master]
-    paths:
-      - Cargo.toml
-      - crates/izumo/Cargo.toml
-      - .github/workflows/publish.yml
   workflow_dispatch:
     inputs:
       version:
