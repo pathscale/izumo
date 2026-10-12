@@ -25,6 +25,7 @@ pub mod menu_id {
 pub struct MenuBar {
     application_name: String,
     handlers: HashMap<String, Rc<dyn Fn() + 'static>>,
+    overrides: HashMap<String, Rc<dyn Fn() + 'static>>,
 }
 
 impl MenuBar {
@@ -33,6 +34,7 @@ impl MenuBar {
         Self {
             application_name: application_name.into(),
             handlers: HashMap::new(),
+            overrides: HashMap::new(),
         }
     }
 
@@ -47,6 +49,20 @@ impl MenuBar {
         handler: impl Fn() + 'static,
     ) -> Self {
         self.handlers.insert(id.into(), Rc::new(handler));
+        self
+    }
+
+    /// Register a callback that replaces a built-in menu action.
+    ///
+    /// Callbacks run on the native UI thread. When an override is registered,
+    /// its callback runs instead of the built-in action and any `on_menu_event`
+    /// callback for that identifier.
+    pub fn on_menu_override(
+        mut self,
+        id: impl Into<String>,
+        handler: impl Fn() + 'static,
+    ) -> Self {
+        self.overrides.insert(id.into(), Rc::new(handler));
         self
     }
 
@@ -75,7 +91,7 @@ impl AppBuilder {
     ///
     /// On macOS, call this while building the app on the main thread. Menu
     /// callbacks are registered by their string identifiers with
-    /// [`MenuBar::on_menu_event`].
+    /// [`MenuBar::on_menu_event`] or [`MenuBar::on_menu_override`].
     pub fn menu(self, menu: MenuBar) -> Self {
         if let Err(error) = menu.install() {
             eprintln!("izumo: unable to install native menu: {error}");
@@ -154,7 +170,12 @@ mod macos {
     impl MenuBar {
         fn callback(&self, id: &'static str, action: BuiltinAction) -> Box<dyn Fn() + 'static> {
             let callback = self.handlers.get(id).cloned();
+            let override_callback = self.overrides.get(id).cloned();
             Box::new(move || {
+                if let Some(callback) = &override_callback {
+                    callback();
+                    return;
+                }
                 perform_builtin(action);
                 if let Some(callback) = &callback {
                     callback();
