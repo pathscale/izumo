@@ -5,6 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
+nagoya = { version = "^0.1.12", path = "../../../nagoya", features = ["reactor"] }
+libc = "^0.2.189"
 anyrender = { package = "ps-anyrender", version = "^0.13" }
 anyrender_vello_cpu = { package = "ps-anyrender-vello-cpu", version = "^0.17.3", features = ["multithreading"] }
 blitz-dom = { package = "ps-blitz-dom", version = "^0.6", features = ["system-fonts"] }

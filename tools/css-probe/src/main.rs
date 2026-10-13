@@ -11,8 +11,13 @@ use blitz_traits::shell::{ColorScheme, Viewport};
 use image::{ImageBuffer, Rgba};
 use url::Url;
 
+#[path = "app_caps.rs"]
+mod app_caps;
+
 fn main() -> Result<(), String> {
-    let mut args = env::args_os().skip(1);
+    let _caps = app_caps::start([2147483648, 120, 180, 256, 2, 32, 33554432, 16000000, 10000]);
+    app_caps::stage("tools/css-probe/src/main.rs: running");
+    let mut args = app_caps::args_os().skip(1);
     match args.next().as_deref().and_then(|value| value.to_str()) {
         Some("render") => {
             let input = required_path(&mut args, "input HTML")?;
@@ -90,9 +95,11 @@ fn render(
     let input = input
         .canonicalize()
         .map_err(|error| format!("failed to resolve {}: {error}", input.display()))?;
-    let html = std::fs::read_to_string(&input)
+    let html = app_caps::read_string(&input)
         .map_err(|error| format!("failed to read {}: {error}", input.display()))?;
     let base_url = Url::from_file_path(&input).map_err(|_| "input path is not a file URL")?;
+    app_caps::stage("css-probe: layout and rasterize");
+    app_caps::check("iterations", u64::from(width) * u64::from(height));
     let mut document = HtmlDocument::from_html(
         &html,
         DocumentConfig {
