@@ -32,10 +32,15 @@ use winit::platform::windows::WindowAttributesWindows;
 #[cfg(all(feature = "diagnostics", unix))]
 use blitz_control_protocol::document::snapshot_document;
 #[cfg(all(feature = "agent-control", unix))]
-use blitz_control_protocol::latest::{Latest, Once};
+use blitz_control_protocol::journal::DiagnosticJournal;
+#[cfg(all(feature = "agent-control", unix))]
+use blitz_control_protocol::latest::Once;
 #[cfg(all(feature = "diagnostics", unix))]
+use blitz_control_protocol::{SnapshotRequest, WindowComposition};
+#[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::{
-    DebugSnapshot, DiagnosticsRequest, SnapshotRequest, WindowComposition,
+    TargetCapabilities, TargetCommand, TargetContext, TargetId, TargetInfo, TargetOptions,
+    TargetRequest,
 };
 /*
  * The control surface is `blitz-control-protocol`, not this crate.
@@ -54,19 +59,14 @@ use blitz_control_protocol::{
 #[cfg(target_os = "macos")]
 use crate::TitleBarStyle;
 use crate::{App, AppHandle, AppResult, WindowSpec, attach_ipc_handler};
-#[cfg(all(feature = "agent-control", unix))]
-use blitz_control_protocol::in_process::DocumentControl;
+#[cfg(all(feature = "diagnostics", unix))]
+use blitz_control_protocol::DiagnosticsRequest;
 #[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::server::{
     AgentControlServer, ControlBridge, ControlBridgeRequest, Host,
 };
 #[cfg(all(feature = "agent-control", unix))]
-use blitz_control_protocol::{
-    AgentControlRequest, DebugError, DebugEvent, DebugResponse, TargetCapabilities, TargetCommand,
-    TargetContext, TargetId, TargetInfo, TargetRequest,
-};
-#[cfg(all(feature = "agent-control", unix))]
-use blitz_dom::Document;
+use blitz_control_protocol::{AgentControlRequest, DebugError, DebugEvent, DebugResponse};
 
 type DocumentFactory = dyn Fn(&str) -> Result<ScriptDocument, String> + Send + Sync + 'static;
 type RuntimeTrace = dyn Fn(&str) + Send + Sync + 'static;
@@ -101,7 +101,7 @@ pub fn set_runtime_trace(trace: impl Fn(&str) + Send + Sync + 'static) {
 #[cfg(all(feature = "agent-control", unix))]
 struct AgentControlRuntime {
     bridge: ControlBridge,
-    events: Arc<Latest<DebugEvent>>,
+    events: Arc<DiagnosticJournal>,
     server: Option<AgentControlServer>,
 }
 
@@ -121,7 +121,7 @@ pub fn set_agent_control_enabled(enabled: bool) -> std::io::Result<()> {
     let mut runtime = runtime.lock().unwrap();
     match (enabled, runtime.server.is_some()) {
         (true, false) => {
-            runtime.server = Some(AgentControlServer::start_with_events(
+            runtime.server = Some(AgentControlServer::start_with_journal(
                 runtime.bridge.clone(),
                 Host {
                     name: env!("CARGO_PKG_NAME").into(),
@@ -270,244 +270,462 @@ struct RuntimeApplication {
     /// capture surface. All of that was here, in fields beside a second copy of
     /// the action dispatch that had already drifted from the browser's.
     #[cfg(all(feature = "agent-control", unix))]
-    control: DocumentControl,
+    targets: crate::targets::TargetRegistry,
     #[cfg(all(feature = "agent-control", unix))]
     paint_revision: u64,
     #[cfg(all(feature = "agent-control", unix))]
-    control_events: Arc<Latest<DebugEvent>>,
+    control_events: Arc<DiagnosticJournal>,
 }
 
-impl RuntimeApplication {
-    #[cfg(all(feature = "agent-control", unix))]
-    fn agent_document(&mut self) -> Option<&mut ScriptDocument> {
-        self.blitz
-            .get_mut()
-            .windows
-            .values_mut()
-            .find_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
-    }
-
-    /// Answer one agent-control request against this window's document.
-    ///
-    /// Reading the tree and performing an action are the in-process transport's
-    /// job, and it does them the same way for every host. What is left here is
-    /// what only a runtime can answer: which window's document is the active
-    /// one, and what `Relaunch` and `Quit` mean for a process it started.
-    #[cfg(all(feature = "agent-control", unix))]
-    fn handle_builtin_agent(&mut self, request: AgentControlRequest) -> DebugResponse {
-        match request {
-            AgentControlRequest::ListTargets => {
-                let Some(document) = self.agent_document() else {
-                    return DebugResponse::Error(DebugError {
-                        code: "documentUnavailable".into(),
-                        message: "no active script document".into(),
-                    });
-                };
-                let context = Self::page_context(document);
-                let document = document.inner();
-                let title = document
-                    .query_selector("title")
-                    .ok()
-                    .flatten()
-                    .and_then(|id| document.get_node(id).map(|node| node.text_content()))
-                    .unwrap_or_default();
-                DebugResponse::Targets(vec![TargetInfo {
-                    id: context.target_id,
-                    url: document.url().to_string(),
-                    title,
-                    active: true,
-                    generation: context.generation,
-                    document_id: Some(context.document_id),
-                    capabilities: TargetCapabilities {
-                        agent: true,
-                        diagnostics: cfg!(feature = "diagnostics"),
-                        capture: cfg!(feature = "diagnostics"),
-                        console: false,
-                        runtime_errors: false,
-                        web_gpu: false,
-                    },
-                }])
-            }
-            AgentControlRequest::Inspect { .. } | AgentControlRequest::Act(_) => {
-                let Self { blitz, control, .. } = self;
-                let Some(document) = blitz
-                    .get_mut()
-                    .windows
-                    .values_mut()
-                    .find_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
-                else {
-                    return DebugResponse::Error(DebugError {
-                        code: "documentUnavailable".into(),
-                        message: "no active script document".into(),
-                    });
-                };
-                control.agent(document, request)
-            }
-            // The embedder's answer if it registered one, and this runtime's
-            // own if it did not. Whose answer it is is not this crate's to
-            // decide: an application that must drain a database before it
-            // restarts registers with `blitz_control_protocol::lifecycle`, and
-            // does not reach a window runtime to do it.
-            AgentControlRequest::Relaunch => blitz_control_protocol::lifecycle::lifecycle_handler()
-                .map(|handler| handler(AgentControlRequest::Relaunch))
-                .unwrap_or_else(|| match relaunch_current_process() {
-                    Ok(()) => DebugResponse::Ack,
-                    Err(error) => DebugResponse::Error(DebugError {
-                        code: "relaunchFailed".into(),
-                        message: error.to_string(),
-                    }),
-                }),
-            AgentControlRequest::Quit => DebugResponse::Ack,
-            _ => DebugResponse::Error(DebugError {
-                code: "unsupportedRequest".into(),
-                message: "this runtime does not implement that agent-control request".into(),
-            }),
-        }
-    }
-
-    #[cfg(all(feature = "diagnostics", unix))]
-    fn handle_builtin_diagnostics(&mut self, request: DiagnosticsRequest) -> DebugResponse {
-        match request {
-            DiagnosticsRequest::Snapshot(request) => self
-                .collect_diagnostics(request)
-                .map(DebugResponse::Snapshot)
-                .unwrap_or_else(DebugResponse::Error),
-            DiagnosticsRequest::Metrics => self
-                .collect_diagnostics(SnapshotRequest {
-                    include_dom: false,
-                    include_layout: false,
-                    include_computed_style: false,
-                    node_ids: Vec::new(),
+#[cfg(all(feature = "agent-control", unix))]
+fn with_target_document(
+    blitz: &mut BlitzApplication<VelloWindowRenderer>,
+    page: Option<&crate::targets::PageTarget>,
+    context: &TargetContext,
+    prepare_layout: bool,
+    execute: impl FnOnce(&mut ScriptDocument) -> DebugResponse,
+) -> DebugResponse {
+    use blitz_dom::Document as _;
+    let unavailable = || {
+        DebugResponse::Error(blitz_control_protocol::target::error(
+            "targetUnavailable",
+            "the target has no mounted script document",
+        ))
+    };
+    let owner = page
+        .and_then(|page| page.owner_document_id)
+        .unwrap_or(context.document_id);
+    let Some(root) = blitz
+        .windows
+        .values_mut()
+        .filter_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
+        .find(|document| document.inner().id() as u64 == owner)
+    else {
+        return unavailable();
+    };
+    if let Some(page) = page {
+        let Some(mount) = page.mount_node_id else {
+            return unavailable();
+        };
+        let viewport = if prepare_layout {
+            let inner = root.inner();
+            let mut viewport = inner.viewport().clone();
+            let size = page
+                .viewport_node_id
+                .and_then(|id| inner.get_node(blitz_dom::NodeId::from_u64(id)))
+                .map(|node| node.final_layout().size);
+            size.filter(|size| size.width > 0.0 && size.height > 0.0)
+                .map(|size| {
+                    let scale = viewport.scale();
+                    viewport.window_size =
+                        ((size.width * scale) as u32, (size.height * scale) as u32);
+                    viewport
                 })
-                .map(|snapshot| DebugResponse::Metrics(snapshot.metrics))
-                .unwrap_or_else(DebugResponse::Error),
-            DiagnosticsRequest::WaitForIdle => self
-                .collect_diagnostics(SnapshotRequest {
-                    include_dom: false,
-                    include_layout: false,
-                    include_computed_style: false,
-                    node_ids: Vec::new(),
-                })
-                .map(|snapshot| DebugResponse::Idle(snapshot.revisions))
-                .unwrap_or_else(DebugResponse::Error),
-            // The one diagnostic only a runtime can answer. A renderer capture
-            // cannot see whether an opaque platform window or a tinted native
-            // glass view was placed behind its transparent root, and this crate
-            // is what put it there.
-            DiagnosticsRequest::WindowComposition => {
-                DebugResponse::WindowComposition(native_window_composition())
-            }
-            DiagnosticsRequest::Capture(request) => self
-                .capture_image(request)
-                .map(DebugResponse::Captured)
-                .unwrap_or_else(DebugResponse::Error),
-            DiagnosticsRequest::Observe { .. } => DebugResponse::Error(DebugError {
-                code: "streamingUnavailable".into(),
-                message: "diagnostic subscriptions are not implemented; request snapshots or \
-                          metrics"
-                    .into(),
-            }),
-            _ => DebugResponse::Error(DebugError {
-                code: "unsupportedRequest".into(),
-                message: "this runtime does not implement that diagnostics request".into(),
-            }),
+        } else {
+            None
+        };
+        let mut inner = root.inner_mut();
+        let Some(child) = inner.subdoc_mut(blitz_dom::NodeId::from_u64(mount)) else {
+            return unavailable();
+        };
+        if child.id() as u64 != context.document_id {
+            return DebugResponse::Error(blitz_control_protocol::target::error(
+                "staleDocument",
+                "the mount now owns a different document",
+            ));
         }
-    }
-
-    /// Draw the document offscreen and hand back the pixels.
-    ///
-    /// The point of this is that it is the *same* paint. `blitz_paint::paint_scene`
-    /// is the entry point the window renderer uses, so a capture cannot agree
-    /// with a broken frame or disagree with a good one: whatever the window
-    /// would show is what lands in this buffer.
-    #[cfg(all(feature = "diagnostics", unix))]
-    fn capture_image(
-        &mut self,
-        request: blitz_control_protocol::CaptureRequest,
-    ) -> Result<blitz_control_protocol::CapturedImage, DebugError> {
-        let Self { blitz, control, .. } = self;
-        let document = blitz
-            .get_mut()
-            .windows
-            .values_mut()
-            .find_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
-            .ok_or_else(|| DebugError {
-                code: "documentUnavailable".into(),
-                message: "no active script document".into(),
-            })?;
-        control.capture(document, request)
-    }
-}
-
-impl RuntimeApplication {
-    #[cfg(all(feature = "diagnostics", unix))]
-    fn collect_diagnostics(
-        &mut self,
-        request: SnapshotRequest,
-    ) -> Result<DebugSnapshot, DebugError> {
-        let revision = self.control.next_revision();
-        let document = self.agent_document().ok_or_else(|| DebugError {
-            code: "documentUnavailable".into(),
-            message: "no active script document".into(),
-        })?;
-        snapshot_document(document, request, revision)
+        let Some(document) = (child as &mut dyn std::any::Any).downcast_mut::<ScriptDocument>()
+        else {
+            return unavailable();
+        };
+        if let Some(viewport) = viewport {
+            let changed = document.inner().viewport() != &viewport;
+            if changed {
+                document.inner_mut().set_viewport(viewport);
+                document.inner_mut().resolve(0.0);
+            }
+        }
+        execute(document)
+    } else {
+        if root.inner().id() as u64 != context.document_id {
+            return DebugResponse::Error(blitz_control_protocol::target::error(
+                "staleDocument",
+                "the chrome document changed",
+            ));
+        }
+        execute(root)
     }
 }
 
 #[cfg(all(feature = "agent-control", unix))]
 impl RuntimeApplication {
-    fn page_context(document: &ScriptDocument) -> TargetContext {
-        let document_id = document.inner().id() as u64;
-        TargetContext {
-            target_id: TargetId::Tab(0),
-            generation: (u64::from(std::process::id()) << 32) | document_id,
-            document_id,
+    fn chrome_context(&mut self) -> Option<TargetContext> {
+        use blitz_dom::Document as _;
+        self.blitz
+            .get_mut()
+            .windows
+            .values_mut()
+            .find_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
+            .map(|document| TargetContext {
+                target_id: if crate::targets::has_provider() {
+                    TargetId::chrome()
+                } else {
+                    TargetId::Tab(0)
+                },
+                generation: if crate::targets::has_provider() {
+                    0
+                } else {
+                    (u64::from(std::process::id()) << 32) | document.inner().id() as u64
+                },
+                document_id: document.inner().id() as u64,
+            })
+    }
+
+    fn refresh_targets(&mut self) {
+        let chrome = self.chrome_context();
+        self.targets.refresh(chrome);
+    }
+
+    fn list_targets(&mut self) -> DebugResponse {
+        use blitz_dom::Document as _;
+        let mut targets: Vec<TargetInfo> = self
+            .blitz
+            .get_mut()
+            .windows
+            .values_mut()
+            .filter_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
+            .take(1)
+            .map(|document| TargetInfo {
+                id: if crate::targets::has_provider() {
+                    TargetId::chrome()
+                } else {
+                    TargetId::Tab(0)
+                },
+                url: document
+                    .current_url()
+                    .map_or_else(String::new, ToString::to_string),
+                title: "Chrome".into(),
+                active: true,
+                generation: if crate::targets::has_provider() {
+                    0
+                } else {
+                    (u64::from(std::process::id()) << 32) | document.inner().id() as u64
+                },
+                document_id: Some(document.inner().id() as u64),
+                capabilities: TargetCapabilities {
+                    agent: true,
+                    diagnostics: cfg!(feature = "diagnostics"),
+                    capture: cfg!(feature = "diagnostics"),
+                    console: cfg!(feature = "diagnostics"),
+                    runtime_errors: cfg!(feature = "diagnostics"),
+                    web_gpu: false,
+                },
+            })
+            .collect();
+        targets.extend(self.targets.pages.iter().map(|page| page.info.clone()));
+        DebugResponse::Targets(targets)
+    }
+
+    fn handle_builtin_agent(&mut self, request: AgentControlRequest) -> DebugResponse {
+        self.handle_legacy_target(TargetCommand::Agent(request))
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn handle_builtin_diagnostics(&mut self, request: DiagnosticsRequest) -> DebugResponse {
+        self.handle_legacy_target(TargetCommand::Diagnostics(request))
+    }
+
+    fn handle_legacy_target(&mut self, command: TargetCommand) -> DebugResponse {
+        let mut request = TargetRequest {
+            options: TargetOptions::default(),
+            command,
+        };
+        if !request.instance_scoped()
+            && !crate::targets::has_provider()
+            && let Some(context) = self.chrome_context()
+        {
+            request.options.expected_generation = Some(context.generation);
+            request.options.expected_document_id = Some(context.document_id);
+        }
+        match self.handle_targeted(request) {
+            DebugResponse::Targeted(reply) => *reply.response,
+            response => response,
         }
     }
 
+    fn handle_targeted(&mut self, request: TargetRequest) -> DebugResponse {
+        if let Err(error) = request.validate_options() {
+            return DebugResponse::Error(error);
+        }
+        self.refresh_targets();
+        // Discovery, process lifecycle and platform composition retain instance scope.
+        if request.instance_scoped() {
+            return match request.command {
+                TargetCommand::Agent(AgentControlRequest::ListTargets) => self.list_targets(),
+                TargetCommand::Agent(AgentControlRequest::Quit) => DebugResponse::Ack,
+                TargetCommand::Agent(AgentControlRequest::Relaunch) => {
+                    blitz_control_protocol::lifecycle::lifecycle_handler()
+                        .map(|handler| handler(AgentControlRequest::Relaunch))
+                        .unwrap_or_else(|| match relaunch_current_process() {
+                            Ok(()) => DebugResponse::Ack,
+                            Err(error) => DebugResponse::Error(DebugError {
+                                code: "relaunchFailed".into(),
+                                message: error.to_string(),
+                            }),
+                        })
+                }
+                #[cfg(feature = "diagnostics")]
+                TargetCommand::Diagnostics(DiagnosticsRequest::WindowComposition) => {
+                    DebugResponse::WindowComposition(native_window_composition())
+                }
+                _ => DebugResponse::Error(blitz_control_protocol::target::error(
+                    "diagnosticsUnavailable",
+                    "diagnostics collection is disabled",
+                )),
+            };
+        }
+        if request.options.all_targets {
+            return if cfg!(feature = "diagnostics") {
+                DebugResponse::Ack
+            } else {
+                DebugResponse::Error(blitz_control_protocol::target::error(
+                    "diagnosticsUnavailable",
+                    "diagnostic observation is disabled",
+                ))
+            };
+        }
+        let target_id = request.options.target.as_ref().map_or_else(
+            || {
+                if crate::targets::has_provider() {
+                    TargetId::chrome()
+                } else {
+                    TargetId::Tab(0)
+                }
+            },
+            |target| target.id(),
+        );
+        let page = if target_id == TargetId::chrome()
+            || (!crate::targets::has_provider() && target_id == TargetId::Tab(0))
+        {
+            None
+        } else {
+            match self
+                .targets
+                .pages
+                .iter()
+                .find(|page| page.info.id == target_id)
+            {
+                Some(page) => Some(page.clone()),
+                None => {
+                    return DebugResponse::Error(blitz_control_protocol::target::error(
+                        "unknownTarget",
+                        "the tab is closed or unknown",
+                    ));
+                }
+            }
+        };
+        let context = match &page {
+            Some(page) => match page.info.document_id {
+                Some(document_id) => TargetContext {
+                    target_id,
+                    generation: page.info.generation,
+                    document_id,
+                },
+                None => {
+                    return DebugResponse::Error(blitz_control_protocol::target::error(
+                        "targetUnavailable",
+                        "the tab has not mounted a document",
+                    ));
+                }
+            },
+            None => match self.chrome_context() {
+                Some(context) => context,
+                None => {
+                    return DebugResponse::Error(blitz_control_protocol::target::error(
+                        "targetUnavailable",
+                        "the chrome document is unavailable",
+                    ));
+                }
+            },
+        };
+        if let Err(error) = context.validate(&request) {
+            return DebugResponse::Error(error);
+        }
+        let state = self.targets.state(&context);
+        let result = with_target_document(
+            self.blitz.get_mut(),
+            page.as_ref(),
+            &context,
+            true,
+            |document| match request.command {
+                TargetCommand::Agent(AgentControlRequest::Navigate { url }) => {
+                    match context.target_id {
+                        TargetId::Tab(id) => crate::targets::navigate(id, &url),
+                        _ => DebugResponse::Error(blitz_control_protocol::target::error(
+                            "unsupportedRequest",
+                            "the chrome document cannot navigate",
+                        )),
+                    }
+                }
+                TargetCommand::Agent(request) => state.control.agent(document, request),
+                #[cfg(feature = "diagnostics")]
+                TargetCommand::Diagnostics(request) => match request {
+                    DiagnosticsRequest::Observe { .. } => DebugResponse::Ack,
+                    DiagnosticsRequest::Capture(request) => state
+                        .control
+                        .capture(document, request)
+                        .map(DebugResponse::Captured)
+                        .unwrap_or_else(DebugResponse::Error),
+                    DiagnosticsRequest::Snapshot(request) => {
+                        let revision = state.control.next_revision();
+                        snapshot_document(document, request, revision)
+                            .map(DebugResponse::Snapshot)
+                            .unwrap_or_else(DebugResponse::Error)
+                    }
+                    DiagnosticsRequest::Metrics | DiagnosticsRequest::WaitForIdle => {
+                        let idle = matches!(request, DiagnosticsRequest::WaitForIdle);
+                        let revision = state.control.next_revision();
+                        match snapshot_document(
+                            document,
+                            SnapshotRequest {
+                                include_dom: false,
+                                include_layout: false,
+                                include_computed_style: false,
+                                node_ids: Vec::new(),
+                            },
+                            revision,
+                        ) {
+                            Ok(snapshot) if idle => DebugResponse::Idle(snapshot.revisions),
+                            Ok(snapshot) => DebugResponse::Metrics(snapshot.metrics),
+                            Err(error) => DebugResponse::Error(error),
+                        }
+                    }
+                    request => crate::targets::diagnostics(document, request),
+                },
+                #[cfg(not(feature = "diagnostics"))]
+                TargetCommand::Diagnostics(_) => {
+                    DebugResponse::Error(blitz_control_protocol::target::error(
+                        "diagnosticsUnavailable",
+                        "diagnostics collection is disabled",
+                    ))
+                }
+            },
+        );
+        result.with_context(context)
+    }
+
+    fn publish_target_events(&mut self) {
+        self.refresh_targets();
+        #[cfg(feature = "diagnostics")]
+        if self._agent_control.lock().unwrap().server.is_some() {
+            let mut routes: Vec<(TargetContext, Option<crate::targets::PageTarget>)> = Vec::new();
+            if let Some(context) = self.chrome_context() {
+                routes.push((context, None));
+            }
+            routes.extend(self.targets.pages.iter().filter_map(|page| {
+                page.info.document_id.map(|document_id| {
+                    (
+                        TargetContext {
+                            target_id: page.info.id.clone(),
+                            generation: page.info.generation,
+                            document_id,
+                        },
+                        Some(page.clone()),
+                    )
+                })
+            }));
+            for (context, page) in routes {
+                let state = self.targets.state(&context);
+                let journal = &self.control_events;
+                with_target_document(
+                    self.blitz.get_mut(),
+                    page.as_ref(),
+                    &context,
+                    false,
+                    |document| {
+                        let batch = document.diagnostic_batch(
+                            state.console_sequence,
+                            state.error_sequence,
+                            1000,
+                        );
+                        state.console_sequence = batch.console.next_sequence;
+                        state.error_sequence = batch.errors.next_sequence;
+                        for (stream, lost) in [
+                            (
+                                blitz_control_protocol::DebugStream::Console,
+                                batch.console.lost,
+                            ),
+                            (
+                                blitz_control_protocol::DebugStream::RuntimeErrors,
+                                batch.errors.lost,
+                            ),
+                        ] {
+                            if lost > 0 {
+                                journal.publish(
+                                    context.clone(),
+                                    DebugEvent::DiagnosticLoss { stream, lost },
+                                );
+                            }
+                        }
+                        let mut entries: Vec<_> = batch
+                            .console
+                            .entries
+                            .into_iter()
+                            .map(|entry| (false, entry))
+                            .chain(batch.errors.entries.into_iter().map(|entry| (true, entry)))
+                            .collect();
+                        entries.sort_by_key(|(_, entry)| entry.order);
+                        for (error, entry) in entries {
+                            let event = if error {
+                                DebugEvent::RuntimeError(
+                                    blitz_control_protocol::RuntimeErrorEntry {
+                                        sequence: entry.sequence,
+                                        message: entry.message,
+                                        stack: entry.stack,
+                                        revisions: blitz_control_protocol::RevisionSet {
+                                            document: state.control.revision(),
+                                            ..Default::default()
+                                        },
+                                    },
+                                )
+                            } else {
+                                DebugEvent::Console(blitz_control_protocol::ConsoleEntry {
+                                    sequence: entry.sequence,
+                                    level: entry.level,
+                                    message: entry.message,
+                                })
+                            };
+                            journal.publish(context.clone(), event);
+                        }
+                        DebugResponse::Ack
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "agent-control", unix))]
+impl RuntimeApplication {
     fn handle_targeted_control(
         &mut self,
         event_loop: &dyn ActiveEventLoop,
         request: TargetRequest,
     ) -> DebugResponse {
-        if let Err(error) = request.validate_options() {
-            return DebugResponse::Error(error);
+        let quit = matches!(
+            &request.command,
+            TargetCommand::Agent(AgentControlRequest::Quit)
+        );
+        let relaunch = matches!(
+            &request.command,
+            TargetCommand::Agent(AgentControlRequest::Relaunch)
+        );
+        let delegated = blitz_control_protocol::lifecycle::lifecycle_handler().is_some();
+        let response = self.handle_targeted(request);
+        if matches!(response.unscoped(), DebugResponse::Ack) && (quit || (relaunch && !delegated)) {
+            event_loop.exit();
         }
-        let context = if request.instance_scoped() {
-            None
-        } else {
-            if request
-                .options
-                .target
-                .as_ref()
-                .is_some_and(|target| target.id() != TargetId::Tab(0))
-            {
-                return DebugResponse::Error(blitz_control_protocol::target::error(
-                    "unknownTarget",
-                    "izumo exposes only page 0",
-                ));
-            }
-            let Some(document) = self.agent_document() else {
-                return DebugResponse::Error(DebugError {
-                    code: "documentUnavailable".into(),
-                    message: "no active script document".into(),
-                });
-            };
-            let context = Self::page_context(document);
-            if let Err(error) = context.validate(&request) {
-                return DebugResponse::Error(error);
-            }
-            Some(context)
-        };
-        let request = match request.command {
-            TargetCommand::Agent(request) => ControlBridgeRequest::Agent(request),
-            TargetCommand::Diagnostics(request) => ControlBridgeRequest::Diagnostics(request),
-        };
-        let response = self.handle_runtime_request(event_loop, request);
-        match context {
-            Some(context) => response.with_context(context),
-            None => response,
-        }
+        response
     }
 
     fn handle_runtime_request(
@@ -594,6 +812,8 @@ impl ApplicationHandler for RuntimeApplication {
             runtime_trace("application setup completed");
         }
         self.blitz.get_mut().can_create_surfaces(event_loop);
+        #[cfg(all(feature = "agent-control", unix))]
+        self.publish_target_events();
         runtime_trace("runtime can_create_surfaces completed");
     }
 
@@ -623,11 +843,35 @@ impl ApplicationHandler for RuntimeApplication {
             .get_mut()
             .window_event(event_loop, window_id, event);
         #[cfg(all(feature = "agent-control", unix))]
-        if paint_committed {
+        self.publish_target_events();
+        #[cfg(all(feature = "agent-control", unix))]
+        if paint_committed && agent_control_enabled() {
             self.paint_revision = self.paint_revision.saturating_add(1);
-            self.control_events.set_now(DebugEvent::PaintCommitted {
-                revision: self.paint_revision,
-            });
+            if let Some(context) = self.chrome_context() {
+                self.control_events.publish(
+                    context,
+                    DebugEvent::PaintCommitted {
+                        revision: self.paint_revision,
+                    },
+                );
+            }
+            for page in &self.targets.pages {
+                if page.info.active
+                    && page.info.capabilities.agent
+                    && let Some(document_id) = page.info.document_id
+                {
+                    self.control_events.publish(
+                        TargetContext {
+                            target_id: page.info.id.clone(),
+                            generation: page.info.generation,
+                            document_id,
+                        },
+                        DebugEvent::PaintCommitted {
+                            revision: self.paint_revision,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -640,6 +884,8 @@ impl ApplicationHandler for RuntimeApplication {
             return;
         }
         self.blitz.get_mut().proxy_wake_up(event_loop);
+        #[cfg(all(feature = "agent-control", unix))]
+        self.publish_target_events();
     }
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
@@ -649,6 +895,8 @@ impl ApplicationHandler for RuntimeApplication {
             return;
         }
         self.blitz.get_mut().about_to_wait(event_loop);
+        #[cfg(all(feature = "agent-control", unix))]
+        self.publish_target_events();
     }
 }
 
@@ -707,15 +955,13 @@ pub(crate) fn run(app: App) -> AppResult {
             }
             receiver
         });
-        // A watch channel retains only the newest revision. Inspection is
-        // therefore bounded even when a client stalls or an animation
-        // presents much faster than the client can consume notifications.
-        let event_sender = Latest::new();
+        // One bounded ordered journal, with a cursor owned by each connection.
+        let event_sender = DiagnosticJournal::new(4096);
         let event_receiver = Arc::clone(&event_sender);
         // The embedder's persisted control state is applied during setup.
         // The CLI rescue starts earlier so QA can attach during startup.
         let server = if std::env::args().any(|arg| arg == "--blitz-control") {
-            Some(AgentControlServer::start_with_events(
+            Some(AgentControlServer::start_with_journal(
                 bridge.clone(),
                 Host {
                     name: env!("CARGO_PKG_NAME").into(),
@@ -760,7 +1006,7 @@ pub(crate) fn run(app: App) -> AppResult {
         #[cfg(all(feature = "agent-control", unix))]
         _agent_control: agent_control,
         #[cfg(all(feature = "agent-control", unix))]
-        control: DocumentControl::new(),
+        targets: crate::targets::TargetRegistry::default(),
         #[cfg(all(feature = "agent-control", unix))]
         paint_revision: 0,
         #[cfg(all(feature = "agent-control", unix))]

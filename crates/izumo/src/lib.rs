@@ -39,6 +39,12 @@ mod script_queue;
 pub use script_queue::ScriptQueue;
 #[cfg(feature = "runtime")]
 mod runtime;
+#[cfg(all(feature = "runtime", feature = "agent-control", unix))]
+mod targets;
+#[cfg(all(feature = "runtime", feature = "agent-control", unix))]
+pub use targets::{
+    PageTarget, set_page_diagnostics_handler, set_page_navigation_handler, set_page_target_provider,
+};
 #[cfg(all(target_os = "macos", feature = "runtime"))]
 mod window_effects;
 /// The two capability switches an owner sets, as one decision.

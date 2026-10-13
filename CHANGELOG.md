@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.3
+
+- Route control requests to guarded mounted browser tabs through the page-target provider API.
+
 ## 0.6.2
 
 - Expose the standalone window document as page target 0 through blitz-control-protocol ^0.7.2, with target discovery and identity checks for page control requests.
