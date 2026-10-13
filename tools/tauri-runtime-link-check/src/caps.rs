@@ -129,7 +129,7 @@ pub fn reaped(pid: u32) {
     CHILDREN.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != pid as i32);
 }
 fn stop_children() {
-    #[unix]
+    #[cfg(unix)]
     for pid in CHILDREN.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         // Registered child entry points create a separate process group.
         unsafe { libc::kill(-*pid, libc::SIGKILL); }
@@ -181,21 +181,21 @@ fn sample() {
         if caps().budgets.contains_key(field) { check(field, value); }
     }
 }
-#[unix]
+#[cfg(unix)]
 fn cpu_secs() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 { error("getrusage failed"); }
     (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64
 }
-#[not(unix)]
+#[cfg(not(unix))]
 fn cpu_secs() -> u64 { error("CAP_PLATFORM_UNSUPPORTED: CPU caps require Unix") }
-#[unix]
+#[cfg(unix)]
 extern "C" fn cpu_exceeded(_: libc::c_int) {
     // The timer emits the named error with its live stage and cleans up owned
     // child groups. The kernel hard limit remains the backstop one second later.
     CPU_HIT.store(true, Ordering::Relaxed);
 }
-#[unix]
+#[cfg(unix)]
 fn install_os_limits() {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -214,7 +214,7 @@ fn install_os_limits() {
         }
     }
 }
-#[not(unix)]
+#[cfg(not(unix))]
 fn install_os_limits() { error("CAP_PLATFORM_UNSUPPORTED: OS caps require Unix") }
 #[cfg(target_os = "macos")]
 fn resources() -> std::io::Result<(u64,u64,u64,u64)> {
