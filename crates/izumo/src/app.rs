@@ -137,10 +137,10 @@ impl WindowSpec {
             ("width", self.min_width, self.max_width),
             ("height", self.min_height, self.max_height),
         ] {
-            if let (Some(minimum), Some(maximum)) = (minimum, maximum) {
-                if minimum > maximum {
-                    return Err(format!("window minimum {name} exceeds maximum {name}"));
-                }
+            if let (Some(minimum), Some(maximum)) = (minimum, maximum)
+                && minimum > maximum
+            {
+                return Err(format!("window minimum {name} exceeds maximum {name}"));
             }
         }
         Ok(())

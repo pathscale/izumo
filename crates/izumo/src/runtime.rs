@@ -51,9 +51,9 @@ use blitz_control_protocol::{
  * crate that defines it, because a runtime that forwards one has not removed
  * the edge, only renamed it.
  */
-use crate::{App, AppHandle, AppResult, WindowSpec, attach_ipc_handler};
 #[cfg(target_os = "macos")]
 use crate::TitleBarStyle;
+use crate::{App, AppHandle, AppResult, WindowSpec, attach_ipc_handler};
 #[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::in_process::DocumentControl;
 #[cfg(all(feature = "agent-control", unix))]
@@ -273,7 +273,6 @@ struct RuntimeApplication {
 }
 
 impl RuntimeApplication {
-
     #[cfg(all(feature = "diagnostics", unix))]
     fn agent_document(&mut self) -> Option<&mut ScriptDocument> {
         self.blitz
@@ -763,20 +762,19 @@ fn register_window(
                 .base_color(background_color),
         )
     };
-    let window =
-        BlitzShellWindowConfig::with_attributes(Box::new(document), renderer, attributes)
-            .with_on_created(move |native| {
-                // Setup runs after attributes were snapshotted. Binding replays
-                // the current visibility, including show() on a hidden window.
-                #[cfg(target_os = "macos")]
-                {
-                    let slot = NATIVE_WINDOW.get_or_init(|| Mutex::new(None));
-                    if let Ok(mut guard) = slot.lock() {
-                        *guard = Some(Arc::clone(&native));
-                    }
+    let window = BlitzShellWindowConfig::with_attributes(Box::new(document), renderer, attributes)
+        .with_on_created(move |native| {
+            // Setup runs after attributes were snapshotted. Binding replays
+            // the current visibility, including show() on a hidden window.
+            #[cfg(target_os = "macos")]
+            {
+                let slot = NATIVE_WINDOW.get_or_init(|| Mutex::new(None));
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(Arc::clone(&native));
                 }
-                handle_for_creation.bind_native_window(native);
-            });
+            }
+            handle_for_creation.bind_native_window(native);
+        });
     #[cfg(target_os = "macos")]
     NATIVE_SURFACE_TRANSPARENT.store(config.transparent, Ordering::Release);
     application.add_window(window);
@@ -890,4 +888,3 @@ fn window_attributes(config: &WindowSpec) -> WindowAttributes {
 
     attributes
 }
-

@@ -28,7 +28,7 @@ pub use app::{
 #[cfg(feature = "runtime")]
 mod menu;
 #[cfg(feature = "runtime")]
-pub use menu::{menu_id, MenuBar};
+pub use menu::{MenuBar, menu_id};
 #[cfg(feature = "runtime")]
 mod ipc;
 #[cfg(feature = "runtime")]
@@ -49,8 +49,6 @@ mod window_effects;
 /// embedder to depend on `blitz-traits` for one struct.
 #[cfg(feature = "agent-control")]
 pub use blitz_traits::profiling::DebugOptions as RuntimeDebugOptions;
-#[cfg(feature = "runtime")]
-pub use runtime::{set_document_factory, set_runtime_trace};
 #[cfg(all(feature = "agent-control", unix))]
 #[cfg(feature = "runtime")]
 pub use runtime::{agent_control_enabled, apply_runtime_debug_options, set_agent_control_enabled};
@@ -60,11 +58,11 @@ pub use runtime::{
     begin_deep_profiling, deep_profiling_enabled, deep_profiling_permitted,
     set_deep_profiling_permitted,
 };
+#[cfg(feature = "runtime")]
+pub use runtime::{set_document_factory, set_runtime_trace};
 /// Apply reusable macOS window glass without exposing AppKit to embedders.
 #[cfg(all(target_os = "macos", feature = "runtime"))]
 pub use window_effects::set_window_glass;
-#[cfg(feature = "runtime")]
-mod webview;
 #[cfg(feature = "runtime")]
 mod window_dispatch;
 #[cfg(feature = "runtime")]

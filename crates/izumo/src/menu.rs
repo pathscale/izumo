@@ -43,11 +43,7 @@ impl MenuBar {
     /// Callbacks run on the native UI thread. The built-in action, such as
     /// hiding the app or forwarding an Edit key event, runs before its
     /// callback.
-    pub fn on_menu_event(
-        mut self,
-        id: impl Into<String>,
-        handler: impl Fn() + 'static,
-    ) -> Self {
+    pub fn on_menu_event(mut self, id: impl Into<String>, handler: impl Fn() + 'static) -> Self {
         self.handlers.insert(id.into(), Rc::new(handler));
         self
     }
@@ -57,11 +53,7 @@ impl MenuBar {
     /// Callbacks run on the native UI thread. When an override is registered,
     /// its callback runs instead of the built-in action and any `on_menu_event`
     /// callback for that identifier.
-    pub fn on_menu_override(
-        mut self,
-        id: impl Into<String>,
-        handler: impl Fn() + 'static,
-    ) -> Self {
+    pub fn on_menu_override(mut self, id: impl Into<String>, handler: impl Fn() + 'static) -> Self {
         self.overrides.insert(id.into(), Rc::new(handler));
         self
     }
@@ -69,7 +61,7 @@ impl MenuBar {
     fn install(self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            return macos::install(self);
+            macos::install(self)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -105,9 +97,10 @@ mod macos {
     use std::{cell::RefCell, ffi::CStr};
 
     use objc2::{
-        define_class, msg_send, sel, DefinedClass, MainThreadOnly,
+        DefinedClass, MainThreadOnly, define_class, msg_send,
         rc::Retained,
         runtime::{AnyClass, AnyObject},
+        sel,
     };
     use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSString};
 
@@ -143,7 +136,7 @@ mod macos {
     );
 
     thread_local! {
-        static ACTION_TARGETS: RefCell<Vec<Retained<MenuAction>>> = RefCell::new(Vec::new());
+        static ACTION_TARGETS: RefCell<Vec<Retained<MenuAction>>> = const { RefCell::new(Vec::new()) };
     }
 
     #[derive(Clone, Copy)]
@@ -358,11 +351,7 @@ mod macos {
         }
     }
 
-    fn add_submenu(
-        parent: &AnyObject,
-        title: &str,
-        submenu: &AnyObject,
-    ) -> Result<(), String> {
+    fn add_submenu(parent: &AnyObject, title: &str, submenu: &AnyObject) -> Result<(), String> {
         let item = new_object(c"NSMenuItem")?;
         set_title(&item, title);
         unsafe {
@@ -373,8 +362,8 @@ mod macos {
     }
 
     fn add_separator(menu: &AnyObject) -> Result<(), String> {
-        let class = AnyClass::get(c"NSMenuItem")
-            .ok_or_else(|| "NSMenuItem is unavailable".to_string())?;
+        let class =
+            AnyClass::get(c"NSMenuItem").ok_or_else(|| "NSMenuItem is unavailable".to_string())?;
         let item: Retained<AnyObject> = unsafe { msg_send![class, separatorItem] };
         unsafe {
             let _: () = msg_send![menu, addItem: &*item];
@@ -416,7 +405,9 @@ mod macos {
         main_thread: &MainThreadMarker,
         action: Box<dyn Fn() + 'static>,
     ) -> Retained<MenuAction> {
-        let this = main_thread.alloc::<MenuAction>().set_ivars(MenuActionIvars { action });
+        let this = main_thread
+            .alloc::<MenuAction>()
+            .set_ivars(MenuActionIvars { action });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -467,8 +458,7 @@ mod macos {
         let Ok(app) = shared_application() else {
             return;
         };
-        let window: Option<Retained<AnyObject>> =
-            unsafe { msg_send![&*app, keyWindow] };
+        let window: Option<Retained<AnyObject>> = unsafe { msg_send![&*app, keyWindow] };
         let Some(window) = window else {
             return;
         };
@@ -489,13 +479,11 @@ mod macos {
         let Ok(app) = shared_application() else {
             return;
         };
-        let window: Option<Retained<AnyObject>> =
-            unsafe { msg_send![&*app, keyWindow] };
+        let window: Option<Retained<AnyObject>> = unsafe { msg_send![&*app, keyWindow] };
         let Some(window) = window else {
             return;
         };
-        let responder: Option<Retained<AnyObject>> =
-            unsafe { msg_send![&*window, firstResponder] };
+        let responder: Option<Retained<AnyObject>> = unsafe { msg_send![&*window, firstResponder] };
         let Some(responder) = responder else {
             return;
         };
@@ -611,4 +599,3 @@ mod macos {
         }
     }
 }
-

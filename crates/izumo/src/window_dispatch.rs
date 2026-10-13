@@ -4,4 +4,3 @@
 //! provides visibility changes, UI-thread work, and application events.
 
 pub type BlitzWindowDispatcher = crate::AppHandle;
-
