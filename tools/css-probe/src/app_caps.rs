@@ -5,16 +5,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const NAMES: [&str; 9] = ["rss", "cpu-secs", "wall-secs", "open-files", "procs", "threads", "input-bytes", "iterations", "cache-entries"];
+const NAMES: [&str; 10] = ["rss", "cpu-secs", "wall-secs", "open-files", "procs", "threads", "input-bytes", "iterations", "cache-entries", "decoded-bytes"];
 static CPU_HIT: AtomicBool = AtomicBool::new(false);
 static TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OWNED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 static STATE: OnceLock<Arc<Caps>> = OnceLock::new();
 
 pub struct Caps {
-    hard: [u64; 9],
-    warn: [u64; 9],
-    warned: [AtomicBool; 9],
+    hard: [u64; 10],
+    warn: [u64; 10],
+    warned: [AtomicBool; 10],
     args: Arc<[OsString]>,
     stage: Mutex<Arc<str>>,
     started: Instant,
@@ -37,9 +37,9 @@ fn number(value: &str) -> u64 {
         .unwrap_or_else(|| fail(format!("CAP_BAD_PARAMETER value={value:?}")))
 }
 
-pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
+pub fn start(defaults: [u64; 10]) -> Arc<Caps> {
     let mut hard = defaults;
-    let mut supplied = [None; 9];
+    let mut supplied = [None; 10];
     let mut args = Vec::new();
     let mut raw = std::env::args_os();
     args.push(raw.next().unwrap_or_default());
@@ -67,7 +67,7 @@ pub fn start(defaults: [u64; 9]) -> Arc<Caps> {
         args.push(arg);
     }
     let warn = std::array::from_fn(|i| supplied[i].unwrap_or((hard[i] / 2).max(1)));
-    for i in 0..9 {
+    for i in 0..10 {
         if warn[i] > hard[i] { fail(format!("CAP_BAD_PARAMETER warn-{}={} max={}", NAMES[i], warn[i], hard[i])); }
         if help { println!("--max-{} {} --warn-{} {}", NAMES[i], hard[i], NAMES[i], warn[i]); }
     }
