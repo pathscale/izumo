@@ -3,10 +3,9 @@ resolver = "3"
 members = ["crates/izumo"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = true
 homepage = "https://github.com/pathscale/izumo"
 repository = "https://github.com/pathscale/izumo"
-
