@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::env;
+
 use std::path::{Path, PathBuf};
 
 use anyrender::render_to_buffer;
@@ -136,13 +136,22 @@ fn render(
     .map_err(|error| format!("failed to write {}: {error}", output.display()))
 }
 
+fn capped_image(path: &Path) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
+    let bytes = app_caps::read_bytes(path).map_err(|error| error.to_string())?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format().map_err(|error| error.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(app_caps::hard("rss") / 4);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|error| error.to_string())?;
+    app_caps::check("iterations", u64::from(image.width()) * u64::from(image.height()));
+    Ok(image.to_rgba8())
+}
+
 fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
-    let reference = image::open(reference)
-        .map_err(|error| format!("failed to read {}: {error}", reference.display()))?
-        .to_rgba8();
-    let actual = image::open(actual)
-        .map_err(|error| format!("failed to read {}: {error}", actual.display()))?
-        .to_rgba8();
+    let reference = capped_image(reference)?;
+    let actual = capped_image(actual)?;
+    app_caps::stage("css-probe: pixel diff");
     if reference.dimensions() != actual.dimensions() {
         return Err(format!(
             "image dimensions differ: reference {:?}, actual {:?}",
@@ -152,6 +161,7 @@ fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
     }
 
     let (width, height) = reference.dimensions();
+    app_caps::check("iterations", u64::from(width) * u64::from(height));
     let mut diff_image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
     let mut changed_pixels = 0_u64;
     let mut total_error = 0_u64;
@@ -168,6 +178,7 @@ fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
             *color_pairs
                 .entry((reference_pixel.0, actual_pixel.0))
                 .or_default() += 1;
+            app_caps::check("cache-entries", color_pairs.len() as u64);
         }
         let max_rgb_error = channels[..3].iter().copied().max().unwrap_or(0);
         for (index, threshold) in thresholds.iter().enumerate() {
