@@ -108,7 +108,7 @@ fn render(
         height,
     );
     if let Some(background) = background {
-        for pixel in buffer.chunks_exact_mut(4) {
+        for pixel in buffer.as_chunks_mut::<4>().0 {
             let alpha = u16::from(pixel[3]);
             for channel in 0..3 {
                 pixel[channel] = ((u16::from(pixel[channel]) * alpha

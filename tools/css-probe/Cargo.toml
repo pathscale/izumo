@@ -5,11 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-anyrender = "0.12"
-anyrender_vello_cpu = { version = "0.15", features = ["multithreading"] }
-blitz-dom = { path = "../../../blitz-rust/packages/blitz-dom", features = ["system-fonts"] }
-blitz-html = { path = "../../../blitz-rust/packages/blitz-html" }
-blitz-paint = { path = "../../../blitz-rust/packages/blitz-paint" }
-blitz-traits = { path = "../../../blitz-rust/packages/blitz-traits" }
+anyrender = { package = "ps-anyrender", version = "^0.13" }
+anyrender_vello_cpu = { package = "ps-anyrender-vello-cpu", version = "^0.17.3", features = ["multithreading"] }
+blitz-dom = { package = "ps-blitz-dom", version = "^0.6", features = ["system-fonts"] }
+blitz-html = { package = "ps-blitz-html", version = "^0.6" }
+blitz-paint = { package = "ps-blitz-paint", version = "^0.6" }
+blitz-traits = { package = "ps-blitz-traits", version = "^0.6" }
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 url = "2"

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/izumo"]
+members = ["crates/izumo", "tools/css-probe"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = true
