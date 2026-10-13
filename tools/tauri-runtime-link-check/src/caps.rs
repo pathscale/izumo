@@ -193,6 +193,8 @@ fn cpu_secs() -> u64 { error("CAP_PLATFORM_UNSUPPORTED: CPU caps require Unix") 
 extern "C" fn cpu_exceeded(_: libc::c_int) {
     // The timer emits the named error with its live stage and cleans up owned
     // child groups. The kernel hard limit remains the backstop one second later.
+    const MESSAGE: &[u8] = b"CAP_MAX_CPU_SECS: source=RLIMIT_CPU\n";
+    unsafe { libc::write(2, MESSAGE.as_ptr().cast(), MESSAGE.len()); }
     CPU_HIT.store(true, Ordering::Relaxed);
 }
 #[cfg(unix)]
