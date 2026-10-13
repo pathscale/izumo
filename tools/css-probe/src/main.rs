@@ -15,7 +15,9 @@ use url::Url;
 mod app_caps;
 
 fn main() -> Result<(), String> {
-    let _caps = app_caps::start([2147483648, 120, 180, 256, 2, 32, 33554432, 16000000, 10000, 134217728]);
+    let _caps = app_caps::start([
+        2147483648, 120, 180, 256, 2, 32, 33554432, 16000000, 10000, 134217728,
+    ]);
     app_caps::stage("tools/css-probe/src/main.rs: running");
     let mut args = app_caps::args_os().skip(1);
     match args.next().as_deref().and_then(|value| value.to_str()) {
@@ -139,18 +141,25 @@ fn render(
 fn capped_image(path: &Path) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
     let bytes = app_caps::read_bytes(path).map_err(|error| error.to_string())?;
     let header = image::ImageReader::new(std::io::Cursor::new(&bytes))
-        .with_guessed_format().map_err(|error| error.to_string())?;
-    let (width, height) = header.into_dimensions().map_err(|error| error.to_string())?;
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
+    let (width, height) = header
+        .into_dimensions()
+        .map_err(|error| error.to_string())?;
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     app_caps::check("iterations", pixels);
     app_caps::check("decoded-bytes", pixels.saturating_mul(4));
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format().map_err(|error| error.to_string())?;
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(app_caps::hard("decoded-bytes"));
     reader.limits(limits);
     let image = reader.decode().map_err(|error| error.to_string())?;
-    app_caps::check("iterations", u64::from(image.width()) * u64::from(image.height()));
+    app_caps::check(
+        "iterations",
+        u64::from(image.width()) * u64::from(image.height()),
+    );
     Ok(image.to_rgba8())
 }
 
