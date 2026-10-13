@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2
+
+- Expose the standalone window document as page target 0 through blitz-control-protocol ^0.7.2, with target discovery and identity checks for page control requests.
+
 ## 0.6.1
 
 - Require ps-blitz ^0.6 and blitz-control-protocol ^0.7.1 so the runtime shares the strict TLS engine with its consumers.

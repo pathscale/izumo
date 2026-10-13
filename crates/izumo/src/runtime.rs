@@ -61,7 +61,12 @@ use blitz_control_protocol::server::{
     AgentControlServer, ControlBridge, ControlBridgeRequest, Host,
 };
 #[cfg(all(feature = "agent-control", unix))]
-use blitz_control_protocol::{AgentControlRequest, DebugError, DebugEvent, DebugResponse};
+use blitz_control_protocol::{
+    AgentControlRequest, DebugError, DebugEvent, DebugResponse, TargetCapabilities, TargetCommand,
+    TargetContext, TargetId, TargetInfo, TargetRequest,
+};
+#[cfg(all(feature = "agent-control", unix))]
+use blitz_dom::Document;
 
 type DocumentFactory = dyn Fn(&str) -> Result<ScriptDocument, String> + Send + Sync + 'static;
 type RuntimeTrace = dyn Fn(&str) + Send + Sync + 'static;
@@ -273,7 +278,7 @@ struct RuntimeApplication {
 }
 
 impl RuntimeApplication {
-    #[cfg(all(feature = "diagnostics", unix))]
+    #[cfg(all(feature = "agent-control", unix))]
     fn agent_document(&mut self) -> Option<&mut ScriptDocument> {
         self.blitz
             .get_mut()
@@ -291,6 +296,38 @@ impl RuntimeApplication {
     #[cfg(all(feature = "agent-control", unix))]
     fn handle_builtin_agent(&mut self, request: AgentControlRequest) -> DebugResponse {
         match request {
+            AgentControlRequest::ListTargets => {
+                let Some(document) = self.agent_document() else {
+                    return DebugResponse::Error(DebugError {
+                        code: "documentUnavailable".into(),
+                        message: "no active script document".into(),
+                    });
+                };
+                let context = Self::page_context(document);
+                let document = document.inner();
+                let title = document
+                    .query_selector("title")
+                    .ok()
+                    .flatten()
+                    .and_then(|id| document.get_node(id).map(|node| node.text_content()))
+                    .unwrap_or_default();
+                DebugResponse::Targets(vec![TargetInfo {
+                    id: context.target_id,
+                    url: document.url().to_string(),
+                    title,
+                    active: true,
+                    generation: context.generation,
+                    document_id: Some(context.document_id),
+                    capabilities: TargetCapabilities {
+                        agent: true,
+                        diagnostics: cfg!(feature = "diagnostics"),
+                        capture: cfg!(feature = "diagnostics"),
+                        console: false,
+                        runtime_errors: false,
+                        web_gpu: false,
+                    },
+                }])
+            }
             AgentControlRequest::Inspect { .. } | AgentControlRequest::Act(_) => {
                 let Self { blitz, control, .. } = self;
                 let Some(document) = blitz
@@ -419,53 +456,115 @@ impl RuntimeApplication {
 
 #[cfg(all(feature = "agent-control", unix))]
 impl RuntimeApplication {
+    fn page_context(document: &ScriptDocument) -> TargetContext {
+        let document_id = document.inner().id() as u64;
+        TargetContext {
+            target_id: TargetId::Tab(0),
+            generation: (u64::from(std::process::id()) << 32) | document_id,
+            document_id,
+        }
+    }
+
+    fn handle_targeted_control(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        request: TargetRequest,
+    ) -> DebugResponse {
+        if let Err(error) = request.validate_options() {
+            return DebugResponse::Error(error);
+        }
+        let context = if request.instance_scoped() {
+            None
+        } else {
+            if request
+                .options
+                .target
+                .as_ref()
+                .is_some_and(|target| target.id() != TargetId::Tab(0))
+            {
+                return DebugResponse::Error(blitz_control_protocol::target::error(
+                    "unknownTarget",
+                    "izumo exposes only page 0",
+                ));
+            }
+            let Some(document) = self.agent_document() else {
+                return DebugResponse::Error(DebugError {
+                    code: "documentUnavailable".into(),
+                    message: "no active script document".into(),
+                });
+            };
+            let context = Self::page_context(document);
+            if let Err(error) = context.validate(&request) {
+                return DebugResponse::Error(error);
+            }
+            Some(context)
+        };
+        let request = match request.command {
+            TargetCommand::Agent(request) => ControlBridgeRequest::Agent(request),
+            TargetCommand::Diagnostics(request) => ControlBridgeRequest::Diagnostics(request),
+        };
+        let response = self.handle_runtime_request(event_loop, request);
+        match context {
+            Some(context) => response.with_context(context),
+            None => response,
+        }
+    }
+
+    fn handle_runtime_request(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        request: ControlBridgeRequest,
+    ) -> DebugResponse {
+        match request {
+            ControlBridgeRequest::Targeted(request) => {
+                self.handle_targeted_control(event_loop, request)
+            }
+            ControlBridgeRequest::Agent(AgentControlRequest::Quit) => {
+                event_loop.exit();
+                DebugResponse::Ack
+            }
+            ControlBridgeRequest::Agent(AgentControlRequest::Relaunch) => {
+                let delegated = blitz_control_protocol::lifecycle::lifecycle_handler().is_some();
+                let result = self.handle_builtin_agent(AgentControlRequest::Relaunch);
+                if !delegated && matches!(result, DebugResponse::Ack) {
+                    event_loop.exit();
+                }
+                result
+            }
+            ControlBridgeRequest::Agent(request) => self.handle_builtin_agent(request),
+            // A build without `diagnostics` answers rather than
+            // failing to compile the arm. The transport forwards
+            // every request now, because whether a host can collect
+            // a snapshot is the host's answer and not something a
+            // socket can infer; `Host::diagnostics` is what keeps
+            // the tool out of `tools/list` so a client is not
+            // invited to ask in the first place.
+            #[cfg(not(feature = "diagnostics"))]
+            ControlBridgeRequest::Diagnostics(_) => DebugResponse::Error(DebugError {
+                code: "diagnosticsUnavailable".into(),
+                message: "this build has no diagnostics feature; rebuild with \
+                          izumo/diagnostics"
+                    .into(),
+            }),
+            // Answered here, and only here. There used to be a
+            // `set_diagnostics_handler` an embedder could install
+            // to answer instead, which is a runtime proxying an
+            // inspection service: the collectors, the offscreen
+            // paint and the snapshot readers are all
+            // `blitz-control-protocol`, and an embedder that wants
+            // to serve them serves them itself rather than through
+            // the crate that owns the window. Nothing installed
+            // one.
+            #[cfg(feature = "diagnostics")]
+            ControlBridgeRequest::Diagnostics(request) => self.handle_builtin_diagnostics(request),
+        }
+    }
+
     fn drain_runtime_messages(&mut self, event_loop: &dyn ActiveEventLoop) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
                 RuntimeMessage::Control { request, response } => {
-                    let result = match request {
-                        ControlBridgeRequest::Agent(AgentControlRequest::Quit) => {
-                            event_loop.exit();
-                            DebugResponse::Ack
-                        }
-                        ControlBridgeRequest::Agent(AgentControlRequest::Relaunch) => {
-                            let delegated =
-                                blitz_control_protocol::lifecycle::lifecycle_handler().is_some();
-                            let result = self.handle_builtin_agent(AgentControlRequest::Relaunch);
-                            if !delegated && matches!(result, DebugResponse::Ack) {
-                                event_loop.exit();
-                            }
-                            result
-                        }
-                        ControlBridgeRequest::Agent(request) => self.handle_builtin_agent(request),
-                        // A build without `diagnostics` answers rather than
-                        // failing to compile the arm. The transport forwards
-                        // every request now, because whether a host can collect
-                        // a snapshot is the host's answer and not something a
-                        // socket can infer; `Host::diagnostics` is what keeps
-                        // the tool out of `tools/list` so a client is not
-                        // invited to ask in the first place.
-                        #[cfg(not(feature = "diagnostics"))]
-                        ControlBridgeRequest::Diagnostics(_) => DebugResponse::Error(DebugError {
-                            code: "diagnosticsUnavailable".into(),
-                            message: "this build has no diagnostics feature; rebuild with \
-                                      izumo/diagnostics"
-                                .into(),
-                        }),
-                        // Answered here, and only here. There used to be a
-                        // `set_diagnostics_handler` an embedder could install
-                        // to answer instead, which is a runtime proxying an
-                        // inspection service: the collectors, the offscreen
-                        // paint and the snapshot readers are all
-                        // `blitz-control-protocol`, and an embedder that wants
-                        // to serve them serves them itself rather than through
-                        // the crate that owns the window. Nothing installed
-                        // one.
-                        #[cfg(feature = "diagnostics")]
-                        ControlBridgeRequest::Diagnostics(request) => {
-                            self.handle_builtin_diagnostics(request)
-                        }
-                    };
+                    let result = self.handle_runtime_request(event_loop, request);
                     response.fill(result);
                 }
             }
