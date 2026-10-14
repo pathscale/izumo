@@ -16,14 +16,18 @@ This plane is for an AI agent or automation client operating the product:
 - window/app lifecycle including quit and restart with automatic reconnect;
 - pushed tree/lifecycle changes for efficient observation.
 
-Agent-control code is included by the runtime's default `agent-control` feature,
-but the complete interface starts disabled. The owner-controlled runtime settings
-must call `apply_runtime_debug_options` before any listener or descriptor exists;
-turning inspection/control off drops both. On macOS the enabled interface uses a
-Unix-domain socket rather than localhost HTTP, avoiding a browser-reachable port,
-token ceremony, or exclusive automation session. Calls use the standard MCP
-`tools/call` method with the `blitz.agent.control` tool; pushed state uses JSON-RPC
-notifications.
+Agent-control code is included by the runtime's default `agent-control` feature.
+On Unix, the interface normally starts disabled; embedders apply their
+owner-controlled setting with `apply_runtime_debug_options` after initialization.
+The explicit `--blitz-control` CLI rescue starts the socket before setup,
+without consulting that setting. Applying a disabled setting drops the socket
+and descriptor, including one started by the CLI rescue.
+
+The enabled interface uses a Unix domain socket, endpoint-libs framing, and
+JSON-RPC 2.0. Calls use the standard MCP `tools/call` method with the
+`blitz.agent.control` tool; pushed state uses JSON-RPC notifications.
+There is no HTTP listener, bearer token, or exclusive automation session in this
+transport. The separately env-gated legacy controller is described in docs/06.
 
 Use W3C WebDriver/BiDi input semantics and WAI-ARIA/accessibility-tree semantics
 where they fit. MCP may expose discovery and coarse application tools, while
@@ -48,20 +52,29 @@ telemetry unless the second setting is explicitly on.
 
 ## Contract
 
-- The local agent-control listener and descriptor are absent by default and are
-  created/destroyed together by the owner-controlled runtime setting.
+- Without the CLI rescue, the local agent-control listener and descriptor are
+  absent until enabled by the owner-controlled runtime setting. Disabling that
+  setting removes both.
 - Deep profiling can be selected only while inspection/control is enabled;
   disabling either clears retained samples.
-- Local transport only. There is no authentication or exclusive session.
-- A mode-0600 descriptor publishes the address, PID, instance id, protocol
+- The Unix socket has a uid-only trust model. A mode-0700 parent directory is
+  established before binding; the socket and new descriptor are mode 0600.
+  Any process running as the same uid can use the exposed interface. There is
+  no bearer token, application authentication, or exclusive session.
+- The descriptor publishes the Unix socket address, PID, instance id, protocol
   version, renderer, and renderer revision.
-- Set `TAURI_BLITZ_CONTROL_DESCRIPTOR` to a stable path when a launcher wants to
-  watch one descriptor across relaunches. Without it, descriptors are published
-  under the per-user temporary `tauri-blitz-agent` discovery directory.
-- Multiple clients may observe concurrently. Mutating requests are serialized
-  on the UI thread.
-- Relaunch emits the replacement instance id before shutdown. Clients watch the
-  descriptor and reconnect without owner involvement.
+- In `blitz-control-protocol` 0.7.5, descriptors are published under
+  `std::env::temp_dir()/tauri-blitz-agent/<instance-id>.json`; the socket uses
+  the same path with the `.sock` extension. The server does not read
+  `TAURI_BLITZ_CONTROL_DESCRIPTOR`.
+- Multiple clients may observe concurrently. Mutating requests execute on the
+  UI thread.
+- The built-in relaunch starts the replacement and exits the old instance.
+  Its executable path removes every exact `--blitz-control` argument; its
+  macOS bundle path forwards no arguments. A replacement publishes a new
+  descriptor only if inspection is enabled again. Clients rediscover the
+  intended instance and reconnect; the built-in path does not announce a
+  replacement instance id. An embedder lifecycle handler owns its own behavior.
 - Native input carries logical key, physical code, modifiers, pointer phases,
   and wheel phases; it enters the same runtime path as device input.
 - Semantic activation never turns a selected node id back into a screen
@@ -71,6 +84,11 @@ telemetry unless the second setting is explicitly on.
 - Snapshots and screenshots are tied to one settled revision set.
 - Metrics name real stages: input-to-present, style, layout, scene, submit,
   present, total, queue depth, coalesced invalidations, and resident bytes.
+
+The chrome document and all scripts it executes must be trusted. Remote HTTP
+and HTTPS chrome IPC is denied by default. An embedder may explicitly permit
+parsed URLs through `set_remote_ipc_policy`; admission grants access to every
+registered command, not a per-command capability scope.
 
 ## Delivery stages
 
@@ -98,3 +116,4 @@ not inject Command-modified keys or wheel input, treated descendants of
 `display:none` retained views as displayed, exposed revision counters without
 real timings, allowed only one session, and lost its environment during an
 AppKit/LaunchServices relaunch. Each is an acceptance case for this protocol.
+
