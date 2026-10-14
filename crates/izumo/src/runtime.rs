@@ -799,6 +799,7 @@ impl RuntimeApplication {
         crate::surfaces::pages().into_iter().filter_map(|page| {
             let view = blitz.windows.values().find(|view| view.doc.id() as u64 == page.owner_document_id)?;
             let root = view.doc.inner();
+            if page.document_id == page.owner_document_id { return Some((page, root.paint_revision.get())); }
             let child = root.get_node(blitz_dom::NodeId::from_u64(page.mount_node_id))?.element_data()?.sub_doc_data()?;
             (child.id() as u64 == page.document_id).then(|| (page, child.inner().paint_revision.get()))
         }).collect()
@@ -821,7 +822,11 @@ impl RuntimeApplication {
                     let mut root = view.doc.inner_mut();
                     let mount = blitz_dom::NodeId::from_u64(page.mount_node_id);
                     let on_screen = window_visible && root.surface_on_screen(mount);
-                    if let Some(child) = root.subdoc_mut(mount) {
+                    if page.document_id == page.owner_document_id {
+                        visible |= on_screen;
+                        let revision = root.paint_revision.get();
+                        real_paint |= on_screen && submitted && painted.iter().any(|(old, before)| *old == page && revision > *before);
+                    } else if let Some(child) = root.subdoc_mut(mount) {
                         if child.id() as u64 != page.document_id { continue; }
                         visible |= on_screen;
                         let revision = child.inner().paint_revision.get();
