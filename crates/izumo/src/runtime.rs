@@ -58,7 +58,8 @@ use blitz_control_protocol::{
  */
 #[cfg(target_os = "macos")]
 use crate::TitleBarStyle;
-use crate::{App, AppHandle, AppResult, WindowSpec, attach_ipc_handler};
+use crate::ipc::attach_ipc_handler_for_url;
+use crate::{App, AppHandle, AppResult, WindowSpec};
 #[cfg(all(feature = "diagnostics", unix))]
 use blitz_control_protocol::DiagnosticsRequest;
 #[cfg(all(feature = "agent-control", unix))]
@@ -81,6 +82,11 @@ static AGENT_CONTROL_RUNTIME: OnceLock<Mutex<Option<Weak<Mutex<AgentControlRunti
 ///
 /// The factory receives WindowSpec::url. The runtime attaches the application
 /// IPC bridge and ScriptQueue before the document's first native poll.
+///
+/// The chrome document and all scripts it executes must be trusted. The factory
+/// must set the document's actual source URL before returning it. IPC from an
+/// HTTP or HTTPS requested or actual document URL is denied unless explicitly
+/// permitted by [`crate::set_remote_ipc_policy`].
 pub fn set_document_factory(
     factory: impl Fn(&str) -> Result<ScriptDocument, String> + Send + Sync + 'static,
 ) {
@@ -1143,7 +1149,11 @@ fn relaunch_current_process() -> std::io::Result<()> {
         return Ok(());
     }
     std::process::Command::new(executable)
-        .args(std::env::args_os().skip(1))
+        .args(
+            std::env::args_os()
+                .skip(1)
+                .filter(|arg| arg != std::ffi::OsStr::new("--blitz-control")),
+        )
         .spawn()?;
     Ok(())
 }
@@ -1176,7 +1186,11 @@ fn register_window(
     runtime_trace("native window registration entered");
     let mut document = create_document(&config.url)?;
     handle.script_queue().attach_to(&mut document);
-    attach_ipc_handler(&mut document, handle.clone());
+    attach_ipc_handler_for_url(
+        &mut document,
+        handle.clone(),
+        url::Url::parse(&config.url).ok(),
+    );
 
     let attributes = window_attributes(&config);
     let handle_for_creation = handle.clone();

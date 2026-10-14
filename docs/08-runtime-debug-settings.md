@@ -2,9 +2,11 @@
 
 Blitz applications ship two independent, owner-controlled settings:
 
-1. **Enable inspection and agent control** publishes the owner-only local MCP
-   socket and discovery descriptor. It enables `blitz.agent.control` and the
-   non-intrusive parts of `blitz.diagnostics`.
+1. **Enable inspection and agent control** publishes the local MCP Unix socket
+   and discovery descriptor. Filesystem permissions restrict access by uid;
+   any process running as that uid can use the interface. It enables
+   `blitz.agent.control` and the non-intrusive parts of `blitz.diagnostics`
+   when compiled.
 2. **Enable deep intrusive profiling** activates performance-affecting engine
    clocks, counters, maps, locks, and bounded sample retention. It is for a
    deliberately captured trace, not normal operation.
@@ -34,8 +36,19 @@ the same for the collectors they use.
 
 - Compile `izumo/diagnostics` into a build that may need a user
   trace. Compilation makes the capability available; it does not activate it.
-- Both settings default to false. Disabled inspection creates no thread,
-  listener, socket, descriptor, poll, or reconnect work.
+- Both persisted settings default to false. Without `--blitz-control`, disabled
+  inspection creates no agent-control listener, socket, descriptor, or serving
+  task. The CLI rescue explicitly starts that interface before setup without
+  consulting persisted settings; applying inspection off stops it.
+- The built-in relaunch does not forward `--blitz-control`. The replacement
+  must enable inspection again through its normal settings or a fresh explicit
+  launch argument.
+- The socket uses a mode-0700 parent directory and mode-0600 socket and new
+  descriptor. There is no bearer token or application authentication.
+- These settings govern the Unix socket interface. A separately configured
+  legacy HTTP controller may still start through `TAURI_BLITZ_DRIVER`,
+  `TAURI_BLITZ_DRIVER_DESCRIPTOR`, and `TAURI_BLITZ_DRIVER_TOKEN` when
+  `debug-control` is compiled. See docs/06.
 - The deep switch is read once at coarse engine boundaries such as a frame,
   document resolve, or script poll. A disabled section must not read clocks,
   lock sample stores, allocate labels, update maps, or retain samples.
@@ -63,3 +76,4 @@ Every embedder should:
 6. Measure the shipped binary with deep profiling off and on. The disabled
    result is the performance acceptance case; the enabled result quantifies the
    deliberate profiling tax.
+

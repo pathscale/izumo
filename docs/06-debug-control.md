@@ -1,69 +1,98 @@
 # Debug control contract
 
-The Blitz port must be externally controllable and diagnosable before CSS and full-app work.
-This is how an automated development agent observes the real renderer when the UI itself is
-broken. It is a gate, not optional developer convenience.
+The current inspection interface is the local Unix domain socket server owned by
+`blitz-control-protocol`. It carries endpoint-libs framed JSON-RPC 2.0 and exposes
+MCP discovery and tools. It is not a loopback HTTP or WebDriver endpoint.
 
-Do not implement Chrome DevTools Protocol. CDP is a large Chromium-internal surface and Boa
-does not provide a compatible remote inspector. Use the stable W3C WebDriver command model
-for common automation and a small `blitz:*` extension for renderer diagnostics.
+The WebDriver requirements and measured Stage 1.5 result below describe the
+earlier acceptance contract. They are historical context, not the current socket
+wire protocol or authentication model. See [the endpoint protocol](07-endpoint-debug-protocol.md)
+and [runtime debug settings](08-runtime-debug-settings.md) for the current interface.
 
 ## Process boundary
 
 ```text
-WebDriver client
+Local MCP client
       |
-      | loopback HTTP + session token
+      | Unix domain socket, endpoint-libs framing, JSON-RPC 2.0
       v
-debug-control server thread
+blitz-control-protocol server on nagoya
       |
-      | serialized request/reply channel
+      | typed request and response hand-off
       v
-UI/runtime thread -> Boa -> DOM/events -> style/layout -> CPU paint
+UI/runtime thread -> Boa -> DOM/events -> style/layout -> paint
 ```
 
-The server starts before application JavaScript loads and remains reachable after script
-exceptions. It must never access Boa, DOM, layout, or paint state from the server thread.
-Each command is sent to the UI/runtime thread and receives a structured reply with a bounded
-timeout. Start with one active session so commands cannot race.
+The socket server must not access Boa, DOM, layout, or paint state directly.
+Requests are handed to the owning UI/runtime thread. Multiple clients may
+connect; mutations execute on the UI thread without an exclusive automation
+session.
 
-Compile the server only behind a dedicated `debug-control` Cargo feature. Enabling the feature
-does not open a port by itself; startup also requires an explicit environment setting. Bind
-only to `127.0.0.1` (and optionally `::1` later), never to an unspecified interface.
+The runtime's default `agent-control` Cargo feature includes this interface on
+Unix. Compilation alone does not start it. Embedders normally enable it through
+`set_agent_control_enabled` or `apply_runtime_debug_options` after loading owner
+settings. The explicit `--blitz-control` CLI rescue starts it before setup,
+without consulting those settings. Applying a disabled setting stops it.
+The built-in relaunch path does not forward the rescue flag.
 
-## Discovery and authentication
+The `diagnostics` feature adds diagnostic capabilities. Intrusive profiling
+requires its separate runtime permission. See docs/08 for the complete settings
+contract.
 
-The launcher supplies:
+## Discovery and uid-only trust
 
-- `TAURI_BLITZ_DRIVER=127.0.0.1:0` -- port zero asks the OS for a free port.
-- `TAURI_BLITZ_DRIVER_DESCRIPTOR=<path>` -- where the app atomically writes connection data.
+For `blitz-control-protocol` 0.7.5, discovery descriptors are published at:
 
-The descriptor is owner-readable only where the platform supports file modes:
-
-```json
-{
-  "pid": 12345,
-  "address": "127.0.0.1:53177",
-  "token": "<random 256-bit value>",
-  "protocolVersion": 1,
-  "renderer": "blitz",
-  "rendererRevision": "<git revision>"
-}
+```text
+std::env::temp_dir()/tauri-blitz-agent/<instance-id>.json
 ```
 
-Write the descriptor only after `GET /status` can succeed. Remove it on clean shutdown. A
-stale descriptor is rejected when its PID or health check does not match. `POST /session`
-requires the token as the `blitz:token` capability. `/status` returns liveness and protocol
-version but no application data.
+The socket uses the same path with the `.sock` extension. The descriptor
+contains `protocolVersion`, `pid`, `instanceId`, `address`, `renderer`, and
+`rendererRevision`. The address is `unix://<socket-path>` and protocol version
+is 2. There is no token field.
 
-This endpoint can evaluate arbitrary JavaScript. Never enable it in a normal production
-build, log its token, put its token in command-line arguments, or expose it beyond loopback.
+The parent directory is mode 0700 before the socket is bound. The socket and
+new descriptor are mode 0600. Access relies on filesystem permissions and the
+user identity, with no bearer token, application authentication, or exclusive
+session. Any process running as the same uid can connect and use the exposed
+tools. This boundary does not isolate applications running as the same user.
 
-## Minimum WebDriver surface
+A client connects to the Unix socket, performs MCP initialization and tool
+discovery, and calls `blitz.agent.control` or, when available,
+`blitz.diagnostics` through `tools/call`. It must use endpoint-libs framing;
+HTTP requests and WebDriver session creation do not apply.
 
-Implement W3C response envelopes and error names so ordinary WebDriver clients can use the
-endpoint. Unsupported commands must return `unsupported operation`, not a successful empty
-response.
+The descriptor is written after the listener is bound. Dropping the server
+removes its socket and descriptor. Clients must handle stale discovery files
+and validate the intended process and instance when reconnecting. Version 0.7.5
+does not read `TAURI_BLITZ_CONTROL_DESCRIPTOR`; do not rely on that variable to
+select a stable descriptor path.
+
+Control can drive trusted chrome and thereby invoke application commands.
+Diagnostics can expose scripts, DOM, console data, and screenshots. Enable
+inspection only when that access is intended. The chrome document and every
+script it executes must be trusted. HTTP and HTTPS chrome IPC is denied unless
+the embedder explicitly permits its URL through `set_remote_ipc_policy`.
+
+## Separate legacy HTTP controller
+
+This checkout still contains a separate compatibility controller:
+`run()` calls `blitz_script::DebugController::start_from_env` when the
+`debug-control` feature is compiled. It uses `TAURI_BLITZ_DRIVER`,
+`TAURI_BLITZ_DRIVER_DESCRIPTOR`, and `TAURI_BLITZ_DRIVER_TOKEN`.
+The `diagnostics` feature also includes `debug-control`.
+
+That env-gated HTTP controller is distinct from the Unix socket interface and
+its runtime setting. Its token and WebDriver session behavior must not be
+attributed to `blitz-control-protocol`, and disabling the socket setting is not
+a promise that this separately configured controller is disabled.
+
+## Historical minimum WebDriver surface
+
+The earlier WebDriver adapter contract required W3C response envelopes and
+error names. Unsupported commands were required to return
+`unsupported operation`, not a successful empty response.
 
 Minimum commands:
 
@@ -78,18 +107,19 @@ Minimum commands:
 - window handles, current window, and window selection
 
 Element references contain both the Blitz node ID and a document generation. Removing or
-replacing the node makes the reference stale. Never silently retarget a stale reference to a
-new node that reused the same numeric ID.
+replacing the node makes the reference stale. Never silently retarget a stale reference to
+a new node that reused the same numeric ID.
 
 Clicks and keys must enter through Blitz's input/event path. A semantic click is addressed by
 node id and dispatches pointer-down, mouse-down, pointer-up, mouse-up and click to that target;
 it neither calls JavaScript `element.click()` nor asks coordinate hit-testing to choose the node
 again. That preserves propagation bugs while making overflowed controls addressable.
 
-## Blitz diagnostic extensions
+## Historical Blitz diagnostic extensions
 
-The first implementation needs these vendor-prefixed commands; the HTTP routes may follow
-the normal `/session/{session id}/blitz/...` shape.
+The earlier WebDriver adapter specified these vendor-prefixed commands and
+`/session/{session id}/blitz/...` HTTP routes. These are not socket routes or
+MCP tool names.
 
 | Command | Result |
 |---|---|
@@ -110,7 +140,7 @@ revisions at which the error escaped.
 Polling these ordered buffers is sufficient for the first gate. Do not implement WebDriver
 BiDi or a custom WebSocket until a real need for pushed events appears.
 
-## Settled-frame barrier
+## Historical settled-frame acceptance contract
 
 `blitz:waitForIdle` is the reliability primitive. A successful response means:
 
@@ -124,8 +154,8 @@ BiDi or a custom WebSocket until a real need for pushed events appears.
 
 Do not wait for future timers or require repeating timers to disappear. Apply both a time
 budget and work-count budget. If the document keeps mutating or a queue does not drain,
-return a timeout with queue sizes and the last revisions rather than claiming the page is
-idle.
+return a timeout with queue sizes and the last revisions rather than claiming the page
+is idle.
 
 Every successful response carries the relevant counters:
 
@@ -142,9 +172,11 @@ A screenshot and its associated DOM/layout snapshot must be captured behind the 
 and identify the same committed paint revision. This prevents a client from comparing pixels
 from one frame with semantic state from another.
 
-## Stage 1.5 acceptance gate
+## Historical Stage 1.5 acceptance gate
 
-Use the Stage 1 Solid probe as the fixture. From a separate process:
+Use the Stage 1 Solid probe as the fixture. The earlier HTTP/WebDriver gate used the Stage 1 Solid probe from a separate
+process. Its port, token, status, and session checks below apply only to that
+historical transport:
 
 1. Launch with a temporary descriptor path and an OS-selected port.
 2. Wait for the descriptor, validate its PID, and call `/status`.
@@ -161,10 +193,14 @@ Use the Stage 1 Solid probe as the fixture. From a separate process:
 Pass only when the test is repeatable without sleeps. Timeouts wait on explicit readiness,
 revision, and queue conditions; fixed delays are not an acceptable synchronization strategy.
 
-Failure means stop and repair this channel before Stage 2. Without it, later renderer and
-runtime failures cannot be investigated reliably by an external agent.
+This gate originally blocked Stage 2 until the debugging channel worked
+reliably. It is not evidence that the current socket transport has passed
+equivalent acceptance coverage.
 
-### Measured result (2026-08-09)
+### Historical measured result (2026-08-09)
+
+The following records the earlier headless HTTP/WebDriver result. Its token
+checks and transport claims do not describe the current Unix socket server.
 
 **PASS.** Blitz commits `80881334`, `17b2350f`, `a79b9ba7`, and `30ffb7b9` implement and
 verify the transport boundary, runtime diagnostics, input tracing, standard commands, and the
@@ -194,9 +230,10 @@ The test uses no fixed sleeps. It passed with Python unavailable, alongside all 
 Preact, Solid, transport, and doctests. This remains a headless Blitz result, not a Tauri
 runtime result, but Stage 2 may now begin.
 
-## Growth after the gate
+## Historical growth guidance
 
 Keep the Stage 1.5 surface small. Add network inspection, CSS rule provenance, accessibility
 trees, memory/GC statistics, pushed events, or interactive JavaScript breakpoints only in
 response to a demonstrated debugging need. Protocol additions are versioned capabilities so
 old clients fail clearly rather than misreading new responses.
+
