@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -15,12 +14,10 @@ pub struct Caps {
     budgets: BTreeMap<&'static str, Budget>,
     stage: Mutex<Arc<str>>,
     started: Instant,
-    args: Vec<OsString>,
 }
 static CAPS: OnceLock<Arc<Caps>> = OnceLock::new();
 static CHILDREN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 static CPU_HIT: AtomicBool = AtomicBool::new(false);
-static ITERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn error(message: impl std::fmt::Display) -> ! {
     eprintln!("CAP_CONFIGURATION_ERROR: {message}");
@@ -65,7 +62,7 @@ pub fn start(name: &'static str, defaults: &[(&'static str, u64)]) {
         values.insert(field, (hard, warn));
     }
     let mut original = std::env::args_os();
-    let mut args = vec![original.next().unwrap_or_default()];
+    let _program = original.next();
     let mut literal = false;
     while let Some(arg) = original.next() {
         if arg == "--" {
@@ -101,7 +98,6 @@ pub fn start(name: &'static str, defaults: &[(&'static str, u64)]) {
                 continue;
             }
         }
-        args.push(arg);
     }
     let mut budgets = BTreeMap::new();
     for (field, (hard, warning)) in values {
@@ -129,7 +125,6 @@ pub fn start(name: &'static str, defaults: &[(&'static str, u64)]) {
         budgets,
         stage: Mutex::new(Arc::from("startup")),
         started,
-        args,
     });
     CAPS.set(Arc::clone(&caps))
         .unwrap_or_else(|_| error("caps already started"));
@@ -148,18 +143,6 @@ pub fn start(name: &'static str, defaults: &[(&'static str, u64)]) {
 fn caps() -> &'static Arc<Caps> {
     CAPS.get().expect("application caps initialized")
 }
-pub fn args_os() -> std::vec::IntoIter<OsString> {
-    caps().args.clone().into_iter()
-}
-pub fn args() -> std::vec::IntoIter<String> {
-    args_os()
-        .map(|s| {
-            s.into_string()
-                .unwrap_or_else(|_| error("argument is not UTF-8"))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-}
 pub fn stage(value: impl Into<Arc<str>>) {
     *caps().stage.lock().unwrap_or_else(|e| e.into_inner()) = value.into();
 }
@@ -177,7 +160,7 @@ pub fn check(field: &str, current: u64) {
             cap.name,
             current,
             budget.warn,
-            &*stage
+            *stage
         );
     }
     if current > budget.hard || (field == "cpu-secs" && CPU_HIT.load(Ordering::Relaxed)) {
@@ -188,23 +171,11 @@ pub fn check(field: &str, current: u64) {
             cap.name,
             current,
             budget.hard,
-            &*stage
+            *stage
         );
         stop_children();
         std::process::exit(124);
     }
-}
-pub fn child(pid: u32) {
-    CHILDREN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(pid as i32);
-}
-pub fn reaped(pid: u32) {
-    CHILDREN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|p| *p != pid as i32);
 }
 fn stop_children() {
     #[cfg(unix)]
@@ -246,30 +217,6 @@ fn stop_children() {
             }
         }
     }
-}
-pub fn read(reader: impl Read) -> std::io::Result<String> {
-    let mut text = String::new();
-    reader
-        .take(limit("input-bytes") + 1)
-        .read_to_string(&mut text)?;
-    check("input-bytes", text.len() as u64);
-    Ok(text)
-}
-pub fn input(path: &std::path::Path) {
-    stage(path.to_string_lossy().into_owned());
-    let metadata =
-        std::fs::metadata(path).unwrap_or_else(|e| error(format!("{}: {e}", path.display())));
-    check("input-bytes", metadata.len());
-}
-pub fn read_file(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
-    let path = path.as_ref();
-    stage(path.to_string_lossy().into_owned());
-    read(std::fs::File::open(path)?)
-}
-pub fn turn(stage_name: impl Into<Arc<str>>) {
-    stage(stage_name);
-    let current = ITERATIONS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-    check("iterations", current);
 }
 fn sample() {
     let (rss, threads, files, procs) =
