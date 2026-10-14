@@ -102,7 +102,9 @@ fn render(
     let base_url = Url::from_file_path(&input).map_err(|_| "input path is not a file URL")?;
     app_caps::stage("css-probe: layout and rasterize");
     app_caps::check("iterations", u64::from(width) * u64::from(height));
-    let raster_bytes = u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4);
+    let raster_bytes = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4);
     app_caps::check("decoded-bytes", raster_bytes);
     app_caps::reserve_bytes(raster_bytes);
     let mut document = HtmlDocument::from_html(
@@ -158,7 +160,11 @@ fn capped_image(path: &Path) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
     let mut limits = image::Limits::default();
     let maximum = app_caps::hard("decoded-bytes");
     if maximum != u64::MAX - 1 {
-        limits.max_alloc = Some(limits.max_alloc.map_or(maximum, |existing| existing.min(maximum)));
+        limits.max_alloc = Some(
+            limits
+                .max_alloc
+                .map_or(maximum, |existing| existing.min(maximum)),
+        );
     }
     reader.limits(limits);
     let image = reader.decode().map_err(|error| error.to_string())?;
@@ -166,8 +172,15 @@ fn capped_image(path: &Path) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
         "iterations",
         u64::from(image.width()) * u64::from(image.height()),
     );
-    let additional = if image.color() == image::ColorType::Rgba8 { 0 } else { pixels.saturating_mul(4) };
-    app_caps::check("decoded-bytes", (image.as_bytes().len() as u64).saturating_add(additional));
+    let additional = if image.color() == image::ColorType::Rgba8 {
+        0
+    } else {
+        pixels.saturating_mul(4)
+    };
+    app_caps::check(
+        "decoded-bytes",
+        (image.as_bytes().len() as u64).saturating_add(additional),
+    );
     app_caps::reserve_bytes(additional);
     Ok(image.into_rgba8())
 }
@@ -186,7 +199,9 @@ fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
 
     let (width, height) = reference.dimensions();
     app_caps::check("iterations", u64::from(width) * u64::from(height));
-    let raster_bytes = u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4);
+    let raster_bytes = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4);
     app_caps::check("decoded-bytes", raster_bytes.saturating_mul(3));
     app_caps::reserve_bytes(raster_bytes);
     let mut diff_image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
