@@ -29,11 +29,21 @@ pub fn set_page_surface_hooks(
 }
 
 pub(crate) fn pages() -> Vec<PageSurface> {
-    let provider = PROVIDER.get_or_init(|| RwLock::new(None)).read().unwrap().clone();
+    let provider = PROVIDER
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .unwrap()
+        .clone();
     provider.map_or_else(Vec::new, |provider| provider())
 }
 
 pub(crate) fn publish(event: SurfaceEvent) {
-    let observer = OBSERVER.get_or_init(|| RwLock::new(None)).read().unwrap().clone();
-    if let Some(observer) = observer { observer(Arc::new(event)); }
+    let observer = OBSERVER
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .unwrap()
+        .clone();
+    if let Some(observer) = observer {
+        observer(Arc::new(event));
+    }
 }

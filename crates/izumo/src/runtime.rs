@@ -795,26 +795,48 @@ impl RuntimeApplication {
 impl RuntimeApplication {
     fn surface_marks(&self) -> Vec<(crate::surfaces::PageSurface, u64)> {
         let blitz = self.blitz.borrow();
-        crate::surfaces::pages().into_iter().filter_map(|page| {
-            let view = blitz.windows.values().find(|view| view.doc.id() as u64 == page.owner_document_id)?;
-            let root = view.doc.inner();
-            if page.document_id == page.owner_document_id { return Some((page, root.paint_revision.get())); }
-            let child = root.get_node(blitz_dom::NodeId::from_u64(page.mount_node_id))?.element_data()?.sub_doc_data()?;
-            (child.id() as u64 == page.document_id).then(|| (page, child.inner().paint_revision.get()))
-        }).collect()
+        crate::surfaces::pages()
+            .into_iter()
+            .filter_map(|page| {
+                let view = blitz
+                    .windows
+                    .values()
+                    .find(|view| view.doc.id() as u64 == page.owner_document_id)?;
+                let root = view.doc.inner();
+                if page.document_id == page.owner_document_id {
+                    return Some((page, root.paint_revision.get()));
+                }
+                let child = root
+                    .get_node(blitz_dom::NodeId::from_u64(page.mount_node_id))?
+                    .element_data()?
+                    .sub_doc_data()?;
+                (child.id() as u64 == page.document_id)
+                    .then(|| (page, child.inner().paint_revision.get()))
+            })
+            .collect()
     }
 
-    fn observe_surfaces(&mut self, painted: &[(crate::surfaces::PageSurface, u64)], submitted: bool) {
+    fn observe_surfaces(
+        &mut self,
+        painted: &[(crate::surfaces::PageSurface, u64)],
+        submitted: bool,
+    ) {
         let pages = crate::surfaces::pages();
         let mut events = Vec::new();
         {
             let mut blitz = self.blitz.borrow_mut();
-            self.surface_visibility.retain(|page, _| pages.contains(page));
+            self.surface_visibility
+                .retain(|page, _| pages.contains(page));
             for page in pages {
                 let mut visible = false;
                 let mut real_paint = false;
-                for view in blitz.windows.values_mut().filter(|view| view.doc.id() as u64 == page.owner_document_id) {
-                    let window_visible = !self.surfaces_suspended && view.is_visible
+                for view in blitz
+                    .windows
+                    .values_mut()
+                    .filter(|view| view.doc.id() as u64 == page.owner_document_id)
+                {
+                    let window_visible = !self.surfaces_suspended
+                        && view.is_visible
                         && view.window.is_visible().unwrap_or(true)
                         && view.window.is_minimized() != Some(true);
                     let mut root = view.doc.inner_mut();
@@ -823,22 +845,36 @@ impl RuntimeApplication {
                     if page.document_id == page.owner_document_id {
                         visible |= on_screen;
                         let revision = root.paint_revision.get();
-                        real_paint |= on_screen && submitted && painted.iter().any(|(old, before)| *old == page && revision > *before);
+                        real_paint |= on_screen
+                            && submitted
+                            && painted
+                                .iter()
+                                .any(|(old, before)| *old == page && revision > *before);
                     } else if let Some(child) = root.subdoc_mut(mount) {
-                        if child.id() as u64 != page.document_id { continue; }
+                        if child.id() as u64 != page.document_id {
+                            continue;
+                        }
                         visible |= on_screen;
                         let revision = child.inner().paint_revision.get();
-                        real_paint |= on_screen && submitted && painted.iter().any(|(old, before)| *old == page && revision > *before);
+                        real_paint |= on_screen
+                            && submitted
+                            && painted
+                                .iter()
+                                .any(|(old, before)| *old == page && revision > *before);
                         child.set_page_visible(on_screen);
                     }
                 }
                 if self.surface_visibility.insert(page, visible) != Some(visible) {
                     events.push(crate::surfaces::SurfaceEvent::Visibility { page, visible });
                 }
-                if real_paint { events.push(crate::surfaces::SurfaceEvent::Painted { page }); }
+                if real_paint {
+                    events.push(crate::surfaces::SurfaceEvent::Painted { page });
+                }
             }
         }
-        for event in events { crate::surfaces::publish(event); }
+        for event in events {
+            crate::surfaces::publish(event);
+        }
     }
 }
 
@@ -896,11 +932,22 @@ impl ApplicationHandler for RuntimeApplication {
         event: WinitWindowEvent,
     ) {
         let marks = self.surface_marks();
-        let before = self.blitz.borrow().windows.get(&window_id).map(|view| view.submitted_paint);
+        let before = self
+            .blitz
+            .borrow()
+            .windows
+            .get(&window_id)
+            .map(|view| view.submitted_paint);
         self.blitz
             .get_mut()
             .window_event(event_loop, window_id, event);
-        let paint_committed = before.is_some_and(|before| self.blitz.borrow().windows.get(&window_id).is_some_and(|view| view.submitted_paint > before));
+        let paint_committed = before.is_some_and(|before| {
+            self.blitz
+                .borrow()
+                .windows
+                .get(&window_id)
+                .is_some_and(|view| view.submitted_paint > before)
+        });
         self.observe_surfaces(&marks, paint_committed);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
