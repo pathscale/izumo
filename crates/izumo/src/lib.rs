@@ -32,7 +32,7 @@ pub use menu::{MenuBar, menu_id};
 #[cfg(feature = "runtime")]
 mod ipc;
 #[cfg(feature = "runtime")]
-pub use ipc::attach_ipc_handler;
+pub use ipc::{attach_ipc_handler, set_remote_ipc_policy};
 #[cfg(feature = "runtime")]
 mod script_queue;
 #[cfg(feature = "runtime")]
