@@ -106,7 +106,7 @@ macos-private-api = ["runtime"]
 # does not apply -- a Linux build of this crate, shipped or under test, links
 # nothing.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-blitz-dom = { package = "ps-blitz-dom", version = "^0.6", features = ["system-fonts"] }
+blitz-dom = { package = "ps-blitz-dom", path = "../../../ps-blitz/packages/blitz-dom", features = ["system-fonts"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 window-vibrancy = "0.8.0"
