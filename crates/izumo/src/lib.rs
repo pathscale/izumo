@@ -39,6 +39,10 @@ mod script_queue;
 pub use script_queue::ScriptQueue;
 #[cfg(feature = "runtime")]
 mod runtime;
+#[cfg(feature = "runtime")]
+mod surfaces;
+#[cfg(feature = "runtime")]
+pub use surfaces::{PageSurface, SurfaceEvent, set_page_surface_hooks};
 #[cfg(all(feature = "runtime", feature = "agent-control", unix))]
 mod targets;
 #[cfg(all(feature = "runtime", feature = "agent-control", unix))]

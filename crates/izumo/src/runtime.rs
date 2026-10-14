@@ -261,6 +261,8 @@ struct RuntimeApplication {
     #[cfg(all(feature = "agent-control", unix))]
     receiver: Receiver<RuntimeMessage>,
     ready: bool,
+    surfaces_suspended: bool,
+    surface_visibility: std::collections::HashMap<crate::surfaces::PageSurface, bool>,
     #[cfg(all(feature = "agent-control", unix))]
     _agent_control: Arc<Mutex<AgentControlRuntime>>,
     /// The in-process transport over this window's document.
@@ -790,6 +792,53 @@ impl RuntimeApplication {
     }
 }
 
+impl RuntimeApplication {
+    fn surface_marks(&self) -> Vec<(crate::surfaces::PageSurface, u64)> {
+        use blitz_dom::Document as _;
+        let blitz = self.blitz.borrow();
+        crate::surfaces::pages().into_iter().filter_map(|page| {
+            let view = blitz.windows.values().find(|view| view.doc.id() as u64 == page.owner_document_id)?;
+            let root = view.doc.inner();
+            let child = root.get_node(blitz_dom::NodeId::from_u64(page.mount_node_id))?.element_data()?.sub_doc_data()?;
+            (child.id() as u64 == page.document_id).then(|| (page, child.inner().paint_revision.get()))
+        }).collect()
+    }
+
+    fn observe_surfaces(&mut self, painted: &[(crate::surfaces::PageSurface, u64)], submitted: bool) {
+        use blitz_dom::Document as _;
+        let pages = crate::surfaces::pages();
+        let mut events = Vec::new();
+        {
+            let mut blitz = self.blitz.borrow_mut();
+            self.surface_visibility.retain(|page, _| pages.contains(page));
+            for page in pages {
+                let mut visible = false;
+                let mut real_paint = false;
+                for view in blitz.windows.values_mut().filter(|view| view.doc.id() as u64 == page.owner_document_id) {
+                    let window_visible = !self.surfaces_suspended && view.is_visible
+                        && view.window.is_visible().unwrap_or(true)
+                        && view.window.is_minimized() != Some(true);
+                    let mut root = view.doc.inner_mut();
+                    let mount = blitz_dom::NodeId::from_u64(page.mount_node_id);
+                    let on_screen = window_visible && root.surface_on_screen(mount);
+                    if let Some(child) = root.subdoc_mut(mount) {
+                        if child.id() as u64 != page.document_id { continue; }
+                        visible |= on_screen;
+                        let revision = child.inner().paint_revision.get();
+                        real_paint |= on_screen && submitted && painted.iter().any(|(old, before)| *old == page && revision > *before);
+                        child.set_page_visible(on_screen);
+                    }
+                }
+                if self.surface_visibility.insert(page, visible) != Some(visible) {
+                    events.push(crate::surfaces::SurfaceEvent::Visibility { page, visible });
+                }
+                if real_paint { events.push(crate::surfaces::SurfaceEvent::Painted { page }); }
+            }
+        }
+        for event in events { crate::surfaces::publish(event); }
+    }
+}
+
 impl ApplicationHandler for RuntimeApplication {
     #[cfg(target_os = "macos")]
     fn macos_handler(&mut self) -> Option<&mut dyn ApplicationHandlerExtMacOS> {
@@ -812,6 +861,8 @@ impl ApplicationHandler for RuntimeApplication {
             runtime_trace("application setup completed");
         }
         self.blitz.get_mut().can_create_surfaces(event_loop);
+        self.surfaces_suspended = false;
+        self.observe_surfaces(&[], false);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
         runtime_trace("runtime can_create_surfaces completed");
@@ -824,10 +875,14 @@ impl ApplicationHandler for RuntimeApplication {
     fn resumed(&mut self, event_loop: &dyn ActiveEventLoop) {
         runtime_trace("runtime resumed entered");
         self.blitz.get_mut().resumed(event_loop);
+        self.surfaces_suspended = false;
+        self.observe_surfaces(&[], false);
         runtime_trace("runtime resumed completed");
     }
 
     fn suspended(&mut self, event_loop: &dyn ActiveEventLoop) {
+        self.surfaces_suspended = true;
+        self.observe_surfaces(&[], false);
         self.blitz.get_mut().suspended(event_loop);
     }
 
@@ -837,11 +892,13 @@ impl ApplicationHandler for RuntimeApplication {
         window_id: winit::window::WindowId,
         event: WinitWindowEvent,
     ) {
-        #[cfg(all(feature = "agent-control", unix))]
-        let paint_committed = matches!(event, WinitWindowEvent::RedrawRequested);
+        let marks = self.surface_marks();
+        let before = self.blitz.borrow().windows.get(&window_id).map(|view| view.submitted_paint);
         self.blitz
             .get_mut()
             .window_event(event_loop, window_id, event);
+        let paint_committed = before.is_some_and(|before| self.blitz.borrow().windows.get(&window_id).is_some_and(|view| view.submitted_paint > before));
+        self.observe_surfaces(&marks, paint_committed);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
         #[cfg(all(feature = "agent-control", unix))]
@@ -895,6 +952,7 @@ impl ApplicationHandler for RuntimeApplication {
             return;
         }
         self.blitz.get_mut().about_to_wait(event_loop);
+        self.observe_surfaces(&[], false);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
     }
@@ -1003,6 +1061,8 @@ pub(crate) fn run(app: App) -> AppResult {
         #[cfg(all(feature = "agent-control", unix))]
         receiver,
         ready: false,
+        surfaces_suspended: true,
+        surface_visibility: Default::default(),
         #[cfg(all(feature = "agent-control", unix))]
         _agent_control: agent_control,
         #[cfg(all(feature = "agent-control", unix))]
