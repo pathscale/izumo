@@ -1,398 +1,236 @@
+//! Binary-owned, opt-in resource parameters. No argument is removed or reinterpreted.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::Read;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use std::future::Future;
 
-struct Budget {
-    hard: u64,
-    warn: u64,
-    warned: AtomicBool,
-}
+const NAMES: [&str; 11] = ["rss", "cpu-secs", "wall-secs", "open-files", "procs", "threads", "input-bytes", "iterations", "cache-entries", "decoded-bytes", "pixels"];
+struct Budget { hard: u64, warn: u64, warned: AtomicBool }
 pub struct Caps {
-    name: &'static str,
     budgets: BTreeMap<&'static str, Budget>,
-    stage: Mutex<Arc<str>>,
     started: Instant,
+    stage: Mutex<Arc<str>>,
 }
-static CAPS: OnceLock<Arc<Caps>> = OnceLock::new();
-static CHILDREN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-static CPU_HIT: AtomicBool = AtomicBool::new(false);
-
-fn error(message: impl std::fmt::Display) -> ! {
-    eprintln!("CAP_CONFIGURATION_ERROR: {message}");
-    std::process::exit(2)
+static STATE: OnceLock<Arc<Caps>> = OnceLock::new();
+static TURNS: AtomicU64 = AtomicU64::new(0);
+static OWNED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("CAP_ERROR {message}");
+    stop_owned();
+    std::process::exit(78)
 }
 fn number(value: &str) -> u64 {
-    let (digits, factor) = match value.as_bytes().last() {
-        Some(b'K' | b'k') => (&value[..value.len() - 1], 1024),
-        Some(b'M' | b'm') => (&value[..value.len() - 1], 1024_u64.pow(2)),
-        Some(b'G' | b'g') => (&value[..value.len() - 1], 1024_u64.pow(3)),
+    let (digits, scale) = match value.as_bytes().last().copied() {
+        Some(b'K' | b'k') => (&value[..value.len()-1], 1u64 << 10),
+        Some(b'M' | b'm') => (&value[..value.len()-1], 1u64 << 20),
+        Some(b'G' | b'g') => (&value[..value.len()-1], 1u64 << 30),
         _ => (value, 1),
     };
-    digits
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(factor))
-        .filter(|n| *n > 0 && *n < u64::MAX)
-        .unwrap_or_else(|| error(format!("invalid positive cap {value:?}")))
+    digits.parse::<u64>().ok().and_then(|n| n.checked_mul(scale))
+        .filter(|n| *n > 0 && *n < u64::MAX - 1)
+        .unwrap_or_else(|| fail(format!("CAP_BAD_PARAMETER {value:?}")))
 }
-fn key(name: &str, field: &str, warning: bool) -> String {
-    format!(
-        "{}_{}_{}",
-        name.replace('-', "_").to_uppercase(),
-        if warning { "WARN" } else { "MAX" },
-        field.replace('-', "_").to_uppercase()
-    )
+/// APP_CAP_PROFILE=default opts into the defaults supplied by this main.
+/// Otherwise only APP_CAP_MAX_<NAME> selects a cap; APP_CAP_WARN_<NAME> adjusts its warning.
+pub fn start(name: &'static str, defaults: &[(&'static str, u64)]) -> Arc<Caps> {
+    let profile = std::env::var_os(&format!("{}_CAP_PROFILE", name.replace('-', "_").to_uppercase()));
+    if profile.as_deref().is_some_and(|s| s != "default") { fail("CAP_BAD_PARAMETER APP_CAP_PROFILE"); }
+    let mut budgets = BTreeMap::new();
+    for name in NAMES {
+        let key = name.replace('-', "_").to_uppercase();
+        let maximum = std::env::var(format!("{}_MAX_{key}", name.replace('-', "_").to_uppercase()));
+        let warning = std::env::var(format!("{}_WARN_{key}", name.replace('-', "_").to_uppercase()));
+        let hard = maximum.ok().map(|s| number(&s)).or_else(|| {
+            profile.as_ref().and_then(|_| defaults.iter().find(|(n,_)| *n == name).map(|(_,n)| *n))
+        });
+        if let Some(hard) = hard {
+            let warn = warning.ok().map(|s| number(&s)).unwrap_or((hard/2).max(1));
+            if hard == 0 || warn > hard { fail(format!("CAP_BAD_PARAMETER {name}: require 0 < warn <= max")); }
+            budgets.insert(name, Budget { hard, warn, warned: AtomicBool::new(false) });
+        } else if warning.is_ok() { fail(format!("CAP_BAD_PARAMETER warn-{name} needs max-{name}")); }
+    }
+    let caps = Arc::new(Caps { budgets, started: Instant::now(), stage: Mutex::new(Arc::from("startup")) });
+    STATE.set(Arc::clone(&caps)).unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
+    caps.census();
+    if NAMES[..6].iter().any(|n| caps.budgets.contains_key(n)) {
+        let runtime = nagoya::runtime::Runtime::new(1);
+        drop(runtime.spawn(CensusTimer { caps: Arc::clone(&caps), deadline: nagoya::time::sleep(Duration::from_secs(1)) }));
+    }
+    caps
+}
+fn current() -> &'static Arc<Caps> { STATE.get().unwrap_or_else(|| fail("CAP_NOT_STARTED")) }
+pub fn hard(name: &str) -> u64 { current().budgets.get(name).map_or(u64::MAX - 1, |b| b.hard) }
+pub fn limit(name: &str) -> u64 { hard(name) }
+pub fn configured(name: &str) -> bool { current().budgets.contains_key(name) }
+pub fn args_os() -> impl Iterator<Item = OsString> { std::env::args_os() }
+pub fn args() -> impl Iterator<Item = String> { std::env::args() }
+pub fn stage(value: impl Into<Arc<str>>) {
+    *current().stage.lock().unwrap_or_else(|e| e.into_inner()) = value.into();
+    current().census();
+}
+pub fn check(name: &str, value: u64) {
+    current().census();
+    current().check(name, value);
+}
+pub fn turn(value: impl Into<Arc<str>>) {
+    stage(value);
+    check("iterations", TURNS.fetch_add(1, Ordering::Relaxed).saturating_add(1));
+}
+impl Caps {
+    fn check(&self, name: &str, value: u64) {
+        let Some(budget) = self.budgets.get(name) else { return };
+        if value >= budget.warn && !budget.warned.swap(true, Ordering::Relaxed) {
+            eprintln!("CAP_WARN_{} current={value} threshold={} stage={:?}", name.replace('-', "_").to_uppercase(), budget.warn, self.stage.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        if value > budget.hard {
+            fail(format!("CAP_{}_EXCEEDED current={value} threshold={} stage={:?}", name.replace('-', "_").to_uppercase(), budget.hard, self.stage.lock().unwrap_or_else(|e| e.into_inner())));
+        }
+    }
+    fn census(&self) {
+        self.check("wall-secs", self.started.elapsed().as_secs());
+        if NAMES[..6].iter().filter(|n| **n != "wall-secs").any(|n| self.budgets.contains_key(n)) {
+            let values = resources().unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")));
+            for (name, value) in values { self.check(name, value); }
+        }
+    }
 }
 
-// This module is compiled only by the application binary. All defaults are
-// passed by its entry point. There is no allocator or library policy here.
-pub fn start(name: &'static str, defaults: &[(&'static str, u64)]) {
-    let started = Instant::now();
-    let mut values = BTreeMap::new();
-    for &(field, default) in defaults {
-        let hard = std::env::var(key(name, field, false))
-            .ok()
-            .map(|s| number(&s))
-            .unwrap_or(default);
-        let warn = std::env::var(key(name, field, true))
-            .ok()
-            .map(|s| number(&s));
-        values.insert(field, (hard, warn));
+#[cfg(target_os = "linux")]
+fn resources() -> std::io::Result<[(&'static str, u64); 5]> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let field = |key: &str| -> std::io::Result<u64> {
+        status.lines().find_map(|s| s.strip_prefix(key)).and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok()).ok_or_else(|| std::io::Error::other("missing process metric"))
+    };
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+    let tail = stat.rsplit_once(')').ok_or_else(|| std::io::Error::other("invalid process stat"))?.1;
+    let mut columns = tail.split_whitespace().skip(11);
+    let user: u64 = columns.next().and_then(|s| s.parse().ok()).ok_or_else(|| std::io::Error::other("missing CPU user ticks"))?;
+    let system: u64 = columns.next().and_then(|s| s.parse().ok()).ok_or_else(|| std::io::Error::other("missing CPU system ticks"))?;
+    unsafe extern "C" { fn sysconf(name: i32) -> std::ffi::c_long; }
+    let ticks = unsafe { sysconf(2) };
+    if ticks <= 0 { return Err(std::io::Error::last_os_error()); }
+    let mut children = std::collections::BTreeSet::new();
+    for task in std::fs::read_dir("/proc/self/task")? {
+        let text = std::fs::read_to_string(task?.path().join("children"))?;
+        for pid in text.split_whitespace().filter_map(|s| s.parse::<u32>().ok()) { children.insert(pid); }
     }
-    let mut original = std::env::args_os();
-    let _program = original.next();
-    let mut literal = false;
-    while let Some(arg) = original.next() {
-        if arg == "--" {
-            literal = true;
-        }
-        let text = arg.to_str().unwrap_or("");
-        let parsed = if literal {
-            None
-        } else {
-            text.strip_prefix("--max-")
-                .map(|s| (s, false))
-                .or_else(|| text.strip_prefix("--warn-").map(|s| (s, true)))
-        };
-        if let Some((tail, warning)) = parsed {
-            let (field, inline) = tail
-                .split_once('=')
-                .map_or((tail, None), |(k, v)| (k, Some(v)));
-            if let Some(value) = values.get_mut(field) {
-                let raw = inline.map(OsString::from).unwrap_or_else(|| {
-                    original
-                        .next()
-                        .unwrap_or_else(|| error(format!("{text} needs a value")))
-                });
-                let n = number(
-                    raw.to_str()
-                        .unwrap_or_else(|| error("cap value must be UTF-8")),
-                );
-                if warning {
-                    value.1 = Some(n);
-                } else {
-                    value.0 = n;
-                }
-                continue;
-            }
-        }
-    }
-    let mut budgets = BTreeMap::new();
-    for (field, (hard, warning)) in values {
-        let warn = warning.unwrap_or((hard / 2).max(1));
-        if hard == 0 || warn > hard {
-            error(format!("{field}: require 0 < warning <= hard"));
-        }
-        // Startup runs before any application threads. The resolved parameters
-        // are config entries inherited by a re-executed worker of this binary.
-        unsafe {
-            std::env::set_var(key(name, field, false), hard.to_string());
-            std::env::set_var(key(name, field, true), warn.to_string());
-        }
-        budgets.insert(
-            field,
-            Budget {
-                hard,
-                warn,
-                warned: AtomicBool::new(false),
-            },
-        );
-    }
-    let caps = Arc::new(Caps {
-        name,
-        budgets,
-        stage: Mutex::new(Arc::from("startup")),
-        started,
-    });
-    CAPS.set(Arc::clone(&caps))
-        .unwrap_or_else(|_| error("caps already started"));
-    install_os_limits();
-    sample();
-    // A dedicated single-worker reactor task keeps caps responsive while an
-    // application worker is busy in a synchronous parser or renderer.
-    let runtime = nagoya::runtime::Runtime::new(1);
-    std::mem::drop(runtime.spawn(async move {
-        loop {
-            nagoya::time::sleep(Duration::from_millis(250)).await;
-            sample();
-        }
-    }));
-}
-fn caps() -> &'static Arc<Caps> {
-    CAPS.get().expect("application caps initialized")
-}
-pub fn stage(value: impl Into<Arc<str>>) {
-    *caps().stage.lock().unwrap_or_else(|e| e.into_inner()) = value.into();
-}
-pub fn limit(field: &str) -> u64 {
-    caps().budgets.get(field).expect("registered cap").hard
-}
-pub fn check(field: &str, current: u64) {
-    let cap = caps();
-    let budget = cap.budgets.get(field).expect("registered cap");
-    if current >= budget.warn && !budget.warned.swap(true, Ordering::Relaxed) {
-        let stage = cap.stage.lock().unwrap_or_else(|e| e.into_inner());
-        eprintln!(
-            "CAP_WARN_{}: app={} current={} threshold={} stage={:?}",
-            field.replace('-', "_").to_uppercase(),
-            cap.name,
-            current,
-            budget.warn,
-            *stage
-        );
-    }
-    if current > budget.hard || (field == "cpu-secs" && CPU_HIT.load(Ordering::Relaxed)) {
-        let stage = cap.stage.lock().unwrap_or_else(|e| e.into_inner());
-        eprintln!(
-            "CAP_MAX_{}: app={} current={} threshold={} stage={:?}",
-            field.replace('-', "_").to_uppercase(),
-            cap.name,
-            current,
-            budget.hard,
-            *stage
-        );
-        stop_children();
-        std::process::exit(124);
-    }
-}
-fn stop_children() {
-    #[cfg(unix)]
-    for pid in CHILDREN.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        // Registered child entry points create a separate process group.
-        unsafe {
-            libc::kill(-*pid, libc::SIGKILL);
-        }
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let mut children = vec![0_i32; 65_536];
-        let bytes = libc::proc_listpids(
-            6,
-            libc::getpid() as u32,
-            children.as_mut_ptr().cast(),
-            (children.len() * 4) as i32,
-        );
-        if bytes > 0 && (bytes as usize) < children.len() * 4 {
-            for pid in &children[..bytes as usize / 4] {
-                if *pid > 0 {
-                    libc::kill(*pid, libc::SIGKILL);
-                }
-            }
-        }
-    }
-    #[cfg(target_os = "linux")]
-    if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
-        for task in tasks.flatten() {
-            if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
-                for pid in text
-                    .split_whitespace()
-                    .filter_map(|s| s.parse::<i32>().ok())
-                {
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
-                }
-            }
-        }
-    }
-}
-fn sample() {
-    let (rss, threads, files, procs) =
-        resources().unwrap_or_else(|e| error(format!("CAP_METRICS_UNAVAILABLE: {e}")));
-    for (field, value) in [
-        ("rss", rss),
-        ("threads", threads),
-        ("open-files", files),
-        ("procs", procs),
-        ("wall-secs", caps().started.elapsed().as_secs()),
-        ("cpu-secs", cpu_secs()),
-    ] {
-        if caps().budgets.contains_key(field) {
-            check(field, value);
-        }
-    }
-}
-#[cfg(unix)]
-fn cpu_secs() -> u64 {
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
-        error("getrusage failed");
-    }
-    (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64
-}
-#[cfg(not(unix))]
-fn cpu_secs() -> u64 {
-    error("CAP_PLATFORM_UNSUPPORTED: CPU caps require Unix")
-}
-#[cfg(unix)]
-extern "C" fn cpu_exceeded(_: libc::c_int) {
-    // The timer emits the named error with its live stage and cleans up owned
-    // child groups. The kernel hard limit remains the backstop one second later.
-    const MESSAGE: &[u8] = b"CAP_MAX_CPU_SECS: source=RLIMIT_CPU\n";
-    unsafe {
-        libc::write(2, MESSAGE.as_ptr().cast(), MESSAGE.len());
-    }
-    CPU_HIT.store(true, Ordering::Relaxed);
-}
-#[cfg(unix)]
-fn install_os_limits() {
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = cpu_exceeded as *const () as usize;
-        libc::sigemptyset(&mut action.sa_mask);
-        if libc::sigaction(libc::SIGXCPU, &action, std::ptr::null_mut()) != 0 {
-            error("sigaction failed");
-        }
-        for (resource, field) in [
-            (libc::RLIMIT_CPU, "cpu-secs"),
-            (libc::RLIMIT_NOFILE, "open-files"),
-        ] {
-            let requested = limit(field);
-            let mut old: libc::rlimit = std::mem::zeroed();
-            if libc::getrlimit(resource, &mut old) != 0 {
-                error("getrlimit failed");
-            }
-            let soft = requested as libc::rlim_t;
-            let hard = if field == "cpu-secs" {
-                soft.saturating_add(1)
-            } else {
-                old.rlim_max
-            };
-            if soft > old.rlim_max {
-                error(format!(
-                    "{field}: requested cap exceeds inherited hard limit"
-                ));
-            }
-            let next = libc::rlimit {
-                rlim_cur: soft,
-                rlim_max: hard.min(old.rlim_max),
-            };
-            if libc::setrlimit(resource, &next) != 0 {
-                error(format!(
-                    "setrlimit {field}: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-    }
-}
-#[cfg(not(unix))]
-fn install_os_limits() {
-    error("CAP_PLATFORM_UNSUPPORTED: OS caps require Unix")
+    let files = std::fs::read_dir("/proc/self/fd")?.count().saturating_sub(1) as u64;
+    Ok([("rss", field("VmRSS:")?.saturating_mul(1024)), ("cpu-secs", user.saturating_add(system)/(ticks as u64)), ("threads", field("Threads:")?), ("open-files", files), ("procs", children.len() as u64)])
 }
 #[cfg(target_os = "macos")]
-fn resources() -> std::io::Result<(u64, u64, u64, u64)> {
+fn resources() -> std::io::Result<[(&'static str, u64); 5]> {
+    #[repr(C)]
+    struct TaskInfo {
+        virtual_size: u64, resident_size: u64, total_user: u64, total_system: u64,
+        threads_user: u64, threads_system: u64, policy: i32, faults: i32,
+        pageins: i32, cow_faults: i32, messages_sent: i32, messages_received: i32,
+        syscalls_mach: i32, syscalls_unix: i32, csw: i32, threadnum: i32,
+        numrunning: i32, priority: i32,
+    }
+    unsafe extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut std::ffi::c_void, size: i32) -> i32;
+        fn proc_listchildpids(pid: i32, buffer: *mut std::ffi::c_void, size: i32) -> i32;
+    }
     unsafe {
-        let pid = libc::getpid();
-        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let pid = std::process::id() as i32;
+        let mut info: TaskInfo = std::mem::zeroed();
         let size = std::mem::size_of_val(&info) as i32;
-        if libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&mut info as *mut libc::proc_taskinfo).cast(),
-            size,
-        ) != size
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let bytes = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
-        if bytes <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut fds: Vec<libc::proc_fdinfo> =
-            Vec::with_capacity((bytes as usize / std::mem::size_of::<libc::proc_fdinfo>()) + 16);
-        let got = libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDLISTFDS,
-            0,
-            fds.as_mut_ptr().cast(),
-            (fds.capacity() * std::mem::size_of::<libc::proc_fdinfo>()) as i32,
-        );
-        if got <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut children = vec![0_i32; 65_536];
-        let child_bytes = libc::proc_listpids(
-            6,
-            pid as u32,
-            children.as_mut_ptr().cast(),
-            (children.len() * 4) as i32,
-        );
-        if child_bytes < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if child_bytes as usize >= children.len() * 4 {
-            return Err(std::io::Error::other("child census saturated"));
-        }
-        let procs = children[..child_bytes as usize / 4]
-            .iter()
-            .filter(|p| **p != 0)
-            .count() as u64;
-        Ok((
-            info.pti_resident_size,
-            info.pti_threadnum as u64,
-            got as u64 / std::mem::size_of::<libc::proc_fdinfo>() as u64,
-            procs,
-        ))
+        if proc_pidinfo(pid, 4, 0, (&mut info as *mut TaskInfo).cast(), size) != size { return Err(std::io::Error::last_os_error()); }
+        let files = if configured("open-files") {
+            let mut descriptors = std::mem::MaybeUninit::<[u8; 8 * 65_537]>::uninit();
+            let size = std::mem::size_of_val(&descriptors) as i32;
+            let count = proc_pidinfo(pid, 1, 0, descriptors.as_mut_ptr().cast(), size);
+            if count < 0 { return Err(std::io::Error::last_os_error()); }
+            current().check("open-files", count as u64 / 8);
+            if count >= size { return Err(std::io::Error::other("descriptor census overflow")); }
+            count as u64 / 8
+        } else { 0 };
+        let procs = if configured("procs") {
+            let mut children = std::mem::MaybeUninit::<[i32; 65_537]>::uninit();
+            let size = std::mem::size_of_val(&children) as i32;
+            let count = proc_listchildpids(pid, children.as_mut_ptr().cast(), size);
+            if count < 0 { return Err(std::io::Error::last_os_error()); }
+            if count >= size {
+                current().check("procs", count as u64 / 4);
+                return Err(std::io::Error::other("child census overflow"));
+            }
+            let children = std::slice::from_raw_parts(children.as_ptr().cast::<i32>(), count as usize / 4);
+            children.iter().filter(|pid| **pid > 0).count() as u64
+        } else { 0 };
+        Ok([("rss", info.resident_size), ("cpu-secs", info.total_user.saturating_add(info.total_system)/1_000_000_000), ("threads", info.threadnum as u64), ("open-files", files), ("procs", procs)])
     }
-}
-#[cfg(target_os = "linux")]
-fn resources() -> std::io::Result<(u64, u64, u64, u64)> {
-    let stat = std::fs::read_to_string("/proc/self/statm")?;
-    let resident = stat
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| std::io::Error::other("invalid statm"))?;
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page <= 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut procs = std::collections::BTreeSet::new();
-    let mut threads = 0;
-    for task in std::fs::read_dir("/proc/self/task")? {
-        threads += 1;
-        let text = std::fs::read_to_string(task?.path().join("children"))?;
-        for pid in text.split_whitespace() {
-            procs.insert(pid.to_owned());
-        }
-    }
-    let files = std::fs::read_dir("/proc/self/fd")?
-        .count()
-        .saturating_sub(1) as u64;
-    Ok((
-        resident.saturating_mul(page as u64),
-        threads,
-        files,
-        procs.len() as u64,
-    ))
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn resources() -> std::io::Result<(u64, u64, u64, u64)> {
-    Err(std::io::Error::other(
-        "CAP_PLATFORM_UNSUPPORTED: resident metrics require macOS or Linux",
-    ))
+fn resources() -> std::io::Result<[(&'static str, u64); 5]> {
+    Err(std::io::Error::other("process caps require macOS or Linux"))
 }
+pub fn reserve_bytes(additional: u64) {
+    if !configured("rss") { return; }
+    let values = resources().unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")));
+    let rss = values.iter().find(|(n,_)| *n == "rss").map_or(0, |(_,v)| *v);
+    check("rss", rss.saturating_add(additional));
+}
+pub fn read_limited(mut reader: impl Read, maximum: u64) -> std::io::Result<Vec<u8>> {
+    let maximum = maximum.min(hard("input-bytes"));
+    let mut bytes = Vec::new();
+    let mut block = [0u8; 8192];
+    loop {
+        let size = maximum.saturating_sub(bytes.len() as u64).saturating_add(1).min(block.len() as u64) as usize;
+        let count = match reader.read(&mut block[..size]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            value => value?,
+        };
+        if count == 0 { return Ok(bytes); }
+        let next = (bytes.len() as u64).saturating_add(count as u64);
+        check("input-bytes", next);
+        if next > maximum { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "input byte budget exceeded")); }
+        reserve_bytes(count as u64);
+        bytes.try_reserve_exact(count).map_err(std::io::Error::other)?;
+        bytes.extend_from_slice(&block[..count]);
+    }
+}
+pub fn read_bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    stage("read file");
+    let file = std::fs::File::open(path)?;
+    check("input-bytes", file.metadata()?.len());
+    read_limited(file, hard("input-bytes"))
+}
+pub fn read_string(path: impl AsRef<Path>) -> std::io::Result<String> {
+    String::from_utf8(read_bytes(path)?).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,e))
+}
+pub fn read_stdin() -> std::io::Result<String> {
+    String::from_utf8(read_limited(std::io::stdin().lock(), hard("input-bytes"))?).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,e))
+}
+pub fn child(pid: u32) { OWNED.lock().unwrap_or_else(|e| e.into_inner()).push(pid); }
+pub fn reaped(pid: u32) { OWNED.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| *p != pid); }
+fn stop_owned() {
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
+        for pid in OWNED.lock().unwrap_or_else(|e| e.into_inner()).iter() { kill(-(*pid as i32), 9); }
+    }
+}
+
+struct CensusTimer { caps: Arc<Caps>, deadline: nagoya::time::Sleep }
+impl Future for CensusTimer {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let timer = self.get_mut();
+        if std::pin::Pin::new(&mut timer.deadline).poll(cx).is_ready() {
+            timer.caps.census();
+            timer.deadline = nagoya::time::sleep(Duration::from_secs(1));
+            let _ = std::pin::Pin::new(&mut timer.deadline).poll(cx);
+        }
+        std::task::Poll::Pending
+    }
+}
+
+pub fn bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> { read_bytes(path) }
+pub fn text(path: impl AsRef<Path>) -> std::io::Result<String> { read_string(path) }

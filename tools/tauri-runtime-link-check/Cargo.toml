@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 libc = "^0.2.189"
-nagoya = { version = "^0.1", path = "../../../nagoya" }
+nagoya = "^0.1.12"
 tauri-runtime = "^2"
