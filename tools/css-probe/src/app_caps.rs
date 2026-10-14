@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::future::Future;
 
 const NAMES: [&str; 10] = [
     "rss",
@@ -74,7 +74,9 @@ pub fn start(defaults: [u64; 10]) -> Arc<Caps> {
             fail(format!("CAP_BAD_PARAMETER warn-{name} needs max-{name}"));
         }
         if hard[i] != u64::MAX - 1 {
-            warn[i] = warning.map(|value| number(&value)).unwrap_or((hard[i] / 2).max(1));
+            warn[i] = warning
+                .map(|value| number(&value))
+                .unwrap_or((hard[i] / 2).max(1));
             if warn[i] > hard[i] {
                 fail(format!("CAP_BAD_PARAMETER warn-{name} exceeds max-{name}"));
             }
@@ -88,7 +90,9 @@ pub fn start(defaults: [u64; 10]) -> Arc<Caps> {
         stage: Mutex::new(Arc::from("startup")),
         started: Instant::now(),
     });
-    STATE.set(Arc::clone(&caps)).unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
+    STATE
+        .set(Arc::clone(&caps))
+        .unwrap_or_else(|_| fail("CAP_ALREADY_STARTED"));
     #[cfg(unix)]
     install_kernel_limits(&hard);
     caps.tick();
@@ -109,7 +113,10 @@ struct CensusTimer {
 }
 impl std::future::Future for CensusTimer {
     type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
         let timer = self.get_mut();
         if std::pin::Pin::new(&mut timer.deadline).poll(cx).is_ready() {
             timer.caps.tick();
@@ -124,18 +131,32 @@ impl std::future::Future for CensusTimer {
 fn install_kernel_limits(hard: &[u64; 10]) {
     unsafe {
         for (resource, requested, margin) in [
-            (libc::RLIMIT_CPU, hard[1], 2), (libc::RLIMIT_NOFILE, hard[3], 0),
+            (libc::RLIMIT_CPU, hard[1], 2),
+            (libc::RLIMIT_NOFILE, hard[3], 0),
         ] {
-            if requested == u64::MAX - 1 { continue; }
+            if requested == u64::MAX - 1 {
+                continue;
+            }
             let mut inherited: libc::rlimit = std::mem::zeroed();
-            if libc::getrlimit(resource, &mut inherited) != 0 { fail(std::io::Error::last_os_error()); }
+            if libc::getrlimit(resource, &mut inherited) != 0 {
+                fail(std::io::Error::last_os_error());
+            }
             let soft = requested.saturating_add(margin) as libc::rlim_t;
-            if soft > inherited.rlim_max { continue; }
-            let limit = libc::rlimit { rlim_cur: soft, rlim_max: inherited.rlim_max };
-            if libc::setrlimit(resource, &limit) != 0 { fail(std::io::Error::last_os_error()); }
+            if soft > inherited.rlim_max {
+                continue;
+            }
+            let limit = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: inherited.rlim_max,
+            };
+            if libc::setrlimit(resource, &limit) != 0 {
+                fail(std::io::Error::last_os_error());
+            }
         }
         if hard[1] != u64::MAX - 1
-            && libc::signal(libc::SIGXCPU, cpu_stop as *const () as libc::sighandler_t) == libc::SIG_ERR {
+            && libc::signal(libc::SIGXCPU, cpu_stop as *const () as libc::sighandler_t)
+                == libc::SIG_ERR
+        {
             fail("CAP_CPU_SIGNAL_SETUP");
         }
     }
@@ -182,7 +203,9 @@ pub fn check(name: &str, value: u64) {
 
 impl Caps {
     fn check(&self, index: usize, value: u64) {
-        if self.hard[index] == u64::MAX - 1 { return; }
+        if self.hard[index] == u64::MAX - 1 {
+            return;
+        }
         if value >= self.warn[index] && !self.warned[index].swap(true, Ordering::Relaxed) {
             let stage = self.stage.lock().unwrap_or_else(|_| fail("CAP_STAGE_LOCK"));
             eprintln!(
@@ -204,7 +227,9 @@ impl Caps {
         }
     }
     fn tick(&self) {
-        if self.hard[..6].iter().all(|value| *value == u64::MAX - 1) { return; }
+        if self.hard[..6].iter().all(|value| *value == u64::MAX - 1) {
+            return;
+        }
         let (rss, threads, files, procs) =
             sample().unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")));
         self.check(0, rss);
@@ -229,31 +254,60 @@ fn sample() -> std::io::Result<(u64, u64, u64, u64)> {
         let mut info: libc::proc_taskinfo = std::mem::zeroed();
         let size = std::mem::size_of_val(&info) as libc::c_int;
         let pid = libc::getpid();
-        if libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&mut info as *mut libc::proc_taskinfo).cast(), size) != size {
+        if libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            size,
+        ) != size
+        {
             return Err(std::io::Error::last_os_error());
         }
         let files = if current().hard[3] != u64::MAX - 1 {
             let mut descriptors = std::mem::MaybeUninit::<[u8; 8 * 65_537]>::uninit();
             let size = std::mem::size_of_val(&descriptors) as libc::c_int;
-            let count = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, descriptors.as_mut_ptr().cast(), size);
-            if count < 0 { return Err(std::io::Error::last_os_error()); }
+            let count = libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                descriptors.as_mut_ptr().cast(),
+                size,
+            );
+            if count < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             current().check(3, count as u64 / 8);
-            if count >= size { return Err(std::io::Error::other("descriptor census overflow")); }
+            if count >= size {
+                return Err(std::io::Error::other("descriptor census overflow"));
+            }
             count as u64 / 8
-        } else { 0 };
+        } else {
+            0
+        };
         let procs = if current().hard[4] != u64::MAX - 1 {
             let mut children = std::mem::MaybeUninit::<[i32; 65_537]>::uninit();
             let size = std::mem::size_of_val(&children) as libc::c_int;
             let count = libc::proc_listchildpids(pid, children.as_mut_ptr().cast(), size);
-            if count < 0 { return Err(std::io::Error::last_os_error()); }
+            if count < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             if count >= size {
                 current().check(4, count as u64 / 4);
                 return Err(std::io::Error::other("child census overflow"));
             }
-            let children = std::slice::from_raw_parts(children.as_ptr().cast::<i32>(), count as usize / 4);
+            let children =
+                std::slice::from_raw_parts(children.as_ptr().cast::<i32>(), count as usize / 4);
             children.iter().filter(|pid| **pid > 0).count() as u64
-        } else { 0 };
-        Ok((info.pti_resident_size, info.pti_threadnum as u64, files, procs))
+        } else {
+            0
+        };
+        Ok((
+            info.pti_resident_size,
+            info.pti_threadnum as u64,
+            files,
+            procs,
+        ))
     }
 }
 
@@ -326,14 +380,21 @@ pub fn read_limited(mut reader: impl std::io::Read, maximum: u64) -> std::io::Re
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             result => result?,
         };
-        if count == 0 { return Ok(bytes); }
+        if count == 0 {
+            return Ok(bytes);
+        }
         let next = (bytes.len() as u64).saturating_add(count as u64);
         check("input-bytes", next);
         if next > maximum {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "input byte budget exceeded"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "input byte budget exceeded",
+            ));
         }
         reserve_bytes(count as u64);
-        bytes.try_reserve_exact(count).map_err(std::io::Error::other)?;
+        bytes
+            .try_reserve_exact(count)
+            .map_err(std::io::Error::other)?;
         bytes.extend_from_slice(&block[..count]);
     }
 }
@@ -342,11 +403,18 @@ pub fn read_stdin() -> std::io::Result<String> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 pub fn reserve_bytes(additional: u64) {
-    if hard("rss") == u64::MAX - 1 { return; }
-    let rss = sample().unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}"))).0;
+    if hard("rss") == u64::MAX - 1 {
+        return;
+    }
+    let rss = sample()
+        .unwrap_or_else(|e| fail(format!("CAP_METRICS_UNAVAILABLE {e}")))
+        .0;
     check("rss", rss.saturating_add(additional));
 }
 
 pub fn args() -> impl Iterator<Item = String> {
-    args_os().map(|s| s.into_string().unwrap_or_else(|_| fail("CAP_NON_UTF8_ARGUMENT")))
+    args_os().map(|s| {
+        s.into_string()
+            .unwrap_or_else(|_| fail("CAP_NON_UTF8_ARGUMENT"))
+    })
 }
