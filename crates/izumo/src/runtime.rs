@@ -794,7 +794,6 @@ impl RuntimeApplication {
 
 impl RuntimeApplication {
     fn surface_marks(&self) -> Vec<(crate::surfaces::PageSurface, u64)> {
-        use blitz_dom::Document as _;
         let blitz = self.blitz.borrow();
         crate::surfaces::pages().into_iter().filter_map(|page| {
             let view = blitz.windows.values().find(|view| view.doc.id() as u64 == page.owner_document_id)?;
@@ -806,7 +805,6 @@ impl RuntimeApplication {
     }
 
     fn observe_surfaces(&mut self, painted: &[(crate::surfaces::PageSurface, u64)], submitted: bool) {
-        use blitz_dom::Document as _;
         let pages = crate::surfaces::pages();
         let mut events = Vec::new();
         {

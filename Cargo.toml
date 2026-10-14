@@ -9,3 +9,13 @@ license = "MIT OR Apache-2.0"
 publish = true
 homepage = "https://github.com/pathscale/izumo"
 repository = "https://github.com/pathscale/izumo"
+
+[patch.crates-io]
+ps-blitz-dom = { path = "../ps-blitz/packages/blitz-dom" }
+ps-blitz-html = { path = "../ps-blitz/packages/blitz-html" }
+ps-blitz-net = { path = "../ps-blitz/packages/blitz-net" }
+ps-blitz-script = { path = "../ps-blitz/packages/blitz-script" }
+ps-blitz-traits = { path = "../ps-blitz/packages/blitz-traits" }
+ps-blitz-paint = { path = "../ps-blitz/packages/blitz-paint" }
+ps-blitz-shell = { path = "../ps-blitz/packages/blitz-shell" }
+ps-blitz-debug-control = { path = "../ps-blitz/packages/blitz-debug-control" }
