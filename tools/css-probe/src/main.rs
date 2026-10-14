@@ -102,6 +102,9 @@ fn render(
     let base_url = Url::from_file_path(&input).map_err(|_| "input path is not a file URL")?;
     app_caps::stage("css-probe: layout and rasterize");
     app_caps::check("iterations", u64::from(width) * u64::from(height));
+    let raster_bytes = u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4);
+    app_caps::check("decoded-bytes", raster_bytes);
+    app_caps::reserve_bytes(raster_bytes);
     let mut document = HtmlDocument::from_html(
         &html,
         DocumentConfig {
@@ -153,14 +156,20 @@ fn capped_image(path: &Path) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
         .with_guessed_format()
         .map_err(|error| error.to_string())?;
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(app_caps::hard("decoded-bytes"));
+    let maximum = app_caps::hard("decoded-bytes");
+    if maximum != u64::MAX - 1 {
+        limits.max_alloc = Some(limits.max_alloc.map_or(maximum, |existing| existing.min(maximum)));
+    }
     reader.limits(limits);
     let image = reader.decode().map_err(|error| error.to_string())?;
     app_caps::check(
         "iterations",
         u64::from(image.width()) * u64::from(image.height()),
     );
-    Ok(image.to_rgba8())
+    let additional = if image.color() == image::ColorType::Rgba8 { 0 } else { pixels.saturating_mul(4) };
+    app_caps::check("decoded-bytes", (image.as_bytes().len() as u64).saturating_add(additional));
+    app_caps::reserve_bytes(additional);
+    Ok(image.into_rgba8())
 }
 
 fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
@@ -177,6 +186,9 @@ fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
 
     let (width, height) = reference.dimensions();
     app_caps::check("iterations", u64::from(width) * u64::from(height));
+    let raster_bytes = u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4);
+    app_caps::check("decoded-bytes", raster_bytes.saturating_mul(3));
+    app_caps::reserve_bytes(raster_bytes);
     let mut diff_image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
     let mut changed_pixels = 0_u64;
     let mut total_error = 0_u64;
@@ -190,10 +202,12 @@ fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
         });
         if channels.iter().any(|channel| *channel != 0) {
             changed_pixels += 1;
-            *color_pairs
-                .entry((reference_pixel.0, actual_pixel.0))
-                .or_default() += 1;
-            app_caps::check("cache-entries", color_pairs.len() as u64);
+            let pair = (reference_pixel.0, actual_pixel.0);
+            if !color_pairs.contains_key(&pair) {
+                app_caps::check("cache-entries", color_pairs.len() as u64 + 1);
+                app_caps::reserve_bytes(std::mem::size_of_val(&pair) as u64 + 8);
+            }
+            *color_pairs.entry(pair).or_default() += 1;
         }
         let max_rgb_error = channels[..3].iter().copied().max().unwrap_or(0);
         for (index, threshold) in thresholds.iter().enumerate() {
@@ -219,6 +233,11 @@ fn diff(reference: &Path, actual: &Path, output: &Path) -> Result<(), String> {
         let percent = count as f64 * 100.0 / pixels as f64;
         println!("pixels_rgb_error_gt_{threshold}={count}/{pixels} ({percent:.4}%)");
     }
+    // Each blur uses floating point intermediates as well as an RGBA output.
+    app_caps::check("decoded-bytes", raster_bytes.saturating_mul(12));
+    app_caps::reserve_bytes(raster_bytes.saturating_mul(9));
+    app_caps::check("decoded-bytes", raster_bytes.saturating_mul(16));
+    app_caps::reserve_bytes(raster_bytes.saturating_mul(13));
     let blurred_reference = image::imageops::blur(&reference, 4.0);
     let blurred_actual = image::imageops::blur(&actual, 4.0);
     let mut blurred_total_error = 0_u64;
