@@ -58,7 +58,7 @@ fn number(value: &str) -> u64 {
 /// APP_CAP_PROFILE=default opts into the defaults supplied by this main.
 /// Otherwise only APP_CAP_MAX_<NAME> selects a cap; APP_CAP_WARN_<NAME> adjusts its warning.
 pub fn start(name: &'static str, defaults: &[(&'static str, u64)]) -> Arc<Caps> {
-    let profile = std::env::var_os(&format!(
+    let profile = std::env::var_os(format!(
         "{}_CAP_PROFILE",
         name.replace('-', "_").to_uppercase()
     ));

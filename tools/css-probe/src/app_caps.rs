@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
-use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
