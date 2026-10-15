@@ -1,4 +1,4 @@
-//! Standalone Blitz and Boa application shell.
+//! Standalone Blitz application shell.
 //!
 //! With the `runtime` feature, [`App`] owns a native window and its winit event
 //! loop. [`WindowSpec`] supplies the native window settings. Embedders provide
@@ -6,7 +6,7 @@
 //! commands, and share application state through [`AppBuilder::manage`].
 //!
 //! [`AppHandle`] is the thread-safe application ingress. Events and UI tasks
-//! enter [`ScriptQueue`] and run on the Boa document's owning thread.
+//! enter [`ScriptQueue`] and run on the selected document's owning thread.
 //!
 //! The Blitz control surface belongs to `blitz-control-protocol`: its
 //! vocabulary, document core, socket transport and in-process transport are
@@ -21,10 +21,14 @@
 #[cfg(feature = "runtime")]
 mod app;
 #[cfg(feature = "runtime")]
+mod document;
+#[cfg(feature = "runtime")]
 pub use app::{
     App, AppBuilder, AppHandle, AppResult, CommandHandler, CommandResult, Theme, TitleBarStyle,
     WindowSpec,
 };
+#[cfg(feature = "runtime")]
+pub use document::{ApplicationDocument, DocumentHost, DocumentPollHook};
 #[cfg(feature = "runtime")]
 mod menu;
 #[cfg(feature = "runtime")]
