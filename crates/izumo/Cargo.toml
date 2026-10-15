@@ -1,6 +1,6 @@
 [package]
 name = "izumo"
-description = "Standalone Blitz and Boa application shell"
+description = "Standalone Blitz application shell"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -29,7 +29,7 @@ blitz-dom = { package = "ps-blitz-dom", version = "^0.6.5", optional = true }
 # that every consumer of this crate needs one installed, including a headless
 # one that reads no font catalogue. An application that wants the machine's
 # fonts asks for them itself, and both consumers already do.
-blitz-script = { package = "ps-blitz-script", version = "^0.6.5" }
+blitz-script = { package = "ps-blitz-script", version = "^0.6.5", default-features = false }
 # The control surface: the vocabulary, the core, and the socket transport this
 # runtime serves its own document over. `capture` carries the offscreen paint
 # and the diagnostic snapshots, and pulls `engine` and `blitz-shell` with it.

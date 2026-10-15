@@ -213,7 +213,7 @@ impl AppHandle {
         Ok(())
     }
 
-    /// Queue work for the UI and Boa document thread.
+    /// Queue work for the UI and document thread.
     ///
     /// This is asynchronous, including calls made from that thread. Callers
     /// must not block waiting for the queued task.

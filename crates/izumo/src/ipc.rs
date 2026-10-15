@@ -1,6 +1,8 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
-use blitz_script::ScriptDocument;
+use blitz_dom::Document;
+
+use crate::DocumentHost;
 use serde_json::Value;
 
 use crate::AppHandle;
@@ -144,7 +146,7 @@ const IPC_SHIM: &str = r#"
 })(window);
 "#;
 
-/// Connect Boa's `window.ipc.postMessage` hook to the application's command table.
+/// Connect the engine's `window.ipc.postMessage` hook to the application's command table.
 ///
 /// Call once on a fresh document, before executing its scripts or polling it.
 /// Commands run on the document thread without holding the command table lock.
@@ -158,76 +160,84 @@ const IPC_SHIM: &str = r#"
 /// The URL is captured when the bridge is attached. Set the document's actual
 /// source URL before calling this function and attach a fresh bridge for each
 /// replacement document. Missing or non-HTTP(S) URLs are not proof of trust.
-pub fn attach_ipc_handler(document: &mut ScriptDocument, handle: AppHandle) {
-    attach_ipc_handler_for_url(document, handle, None);
+pub fn attach_ipc_handler(
+    document: &mut dyn Document,
+    host: Arc<dyn DocumentHost>,
+    handle: AppHandle,
+) {
+    attach_ipc_handler_for_url(document, host, handle, None);
 }
 
 pub(crate) fn attach_ipc_handler_for_url(
-    document: &mut ScriptDocument,
+    document: &mut dyn Document,
+    host: Arc<dyn DocumentHost>,
     handle: AppHandle,
     source_url: Option<url::Url>,
 ) {
     let remote_urls: Vec<url::Url> = source_url
         .into_iter()
-        .chain(document.current_url().cloned())
+        .chain(host.current_url(document))
         .filter(|url| matches!(url.scheme(), "http" | "https"))
         .collect();
 
     let scripts = handle.script_queue().clone();
-    scripts.attach_to(document);
+    scripts.attach_to(document, Arc::clone(&host));
 
-    document.set_ipc_handler(move |body| {
-        let mut message = match serde_json::from_str::<Value>(&body) {
-            Ok(Value::Object(message)) => message,
-            Ok(_) => {
-                eprintln!("izumo: IPC request must be an object");
+    host.set_ipc_handler(
+        document,
+        Box::new(move |body| {
+            let mut message = match serde_json::from_str::<Value>(&body) {
+                Ok(Value::Object(message)) => message,
+                Ok(_) => {
+                    eprintln!("izumo: IPC request must be an object");
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("izumo: invalid IPC request: {error}");
+                    return;
+                }
+            };
+
+            let id = message
+                .remove("id")
+                .and_then(|value| value.as_u64())
+                .filter(|id| *id > 0 && *id <= MAX_REQUEST_ID);
+            let Some(id) = id else {
+                eprintln!("izumo: IPC request id must be a positive safe integer");
                 return;
-            }
-            Err(error) => {
-                eprintln!("izumo: invalid IPC request: {error}");
-                return;
-            }
-        };
+            };
 
-        let id = message
-            .remove("id")
-            .and_then(|value| value.as_u64())
-            .filter(|id| *id > 0 && *id <= MAX_REQUEST_ID);
-        let Some(id) = id else {
-            eprintln!("izumo: IPC request id must be a positive safe integer");
-            return;
-        };
-
-        if !remote_urls.is_empty() {
-            let policy = REMOTE_IPC_POLICY
-                .get_or_init(|| RwLock::new(None))
-                .read()
-                .unwrap()
-                .clone();
-            let permitted = policy
-                .as_ref()
-                .is_some_and(|policy| remote_urls.iter().all(|url| policy(url)));
-            if !permitted {
-                scripts.enqueue_reply(
-                    id,
-                    Err("IPC from remote HTTP(S) chrome documents is not permitted".into()),
-                );
-                return;
+            if !remote_urls.is_empty() {
+                let policy = REMOTE_IPC_POLICY
+                    .get_or_init(|| RwLock::new(None))
+                    .read()
+                    .unwrap()
+                    .clone();
+                let permitted = policy
+                    .as_ref()
+                    .is_some_and(|policy| remote_urls.iter().all(|url| policy(url)));
+                if !permitted {
+                    scripts.enqueue_reply(
+                        id,
+                        Err("IPC from remote HTTP(S) chrome documents is not permitted".into()),
+                    );
+                    return;
+                }
             }
-        }
 
-        let cmd = match message.remove("cmd") {
-            Some(Value::String(cmd)) if !cmd.trim().is_empty() => cmd,
-            _ => {
-                scripts.enqueue_reply(id, Err("izumo command must be nonempty".into()));
-                return;
-            }
-        };
-        let args = message
-            .remove("args")
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        scripts.enqueue_reply(id, handle.invoke(&cmd, args));
-    });
+            let cmd = match message.remove("cmd") {
+                Some(Value::String(cmd)) if !cmd.trim().is_empty() => cmd,
+                _ => {
+                    scripts.enqueue_reply(id, Err("izumo command must be nonempty".into()));
+                    return;
+                }
+            };
+            let args = message
+                .remove("args")
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            scripts.enqueue_reply(id, handle.invoke(&cmd, args));
+        }),
+    );
 
-    document.eval(IPC_SHIM);
+    host.eval(document, IPC_SHIM);
 }
