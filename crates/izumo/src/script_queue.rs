@@ -3,12 +3,14 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Waker};
 
-use blitz_script::ScriptDocument;
+use blitz_dom::Document;
+
+use crate::DocumentHost;
 
 /// Thread-safe ingress for application command replies, events and UI work.
 ///
-/// `ScriptDocument` is intentionally single-threaded. Dispatchers clone this queue and push from
-/// any thread; the native event loop drains it into Boa on the document thread.
+/// Documents stay on their owning thread. Dispatchers clone this queue and push
+/// from any thread; the native event loop drains it through the selected host.
 type EvalCallback = Box<dyn FnOnce(String) + Send + 'static>;
 type DocumentTask = Box<dyn FnOnce() + Send + 'static>;
 
@@ -24,7 +26,7 @@ struct ScriptQueueState {
     waker: Option<Waker>,
 }
 
-/// Queue shared by the application handle and the Boa document thread.
+/// Queue shared by the application handle and the document thread.
 #[derive(Clone, Default)]
 pub struct ScriptQueue(Arc<Mutex<ScriptQueueState>>);
 
@@ -84,12 +86,23 @@ impl ScriptQueue {
     }
 
     /// Attach this queue to the document's native poll cycle.
-    pub fn attach_to(&self, document: &mut ScriptDocument) {
+    pub fn attach_to(&self, document: &mut dyn Document, host: Arc<dyn DocumentHost>) {
         let queue = self.clone();
-        document.add_poll_hook(move |document, task_context| queue.poll(document, task_context));
+        let poll_host = Arc::clone(&host);
+        host.add_poll_hook(
+            document,
+            Box::new(move |document, task_context| {
+                queue.poll(document, poll_host.as_ref(), task_context)
+            }),
+        );
     }
 
-    fn poll(&self, document: &mut ScriptDocument, task_context: Option<&TaskContext<'_>>) -> bool {
+    fn poll(
+        &self,
+        document: &mut dyn Document,
+        host: &dyn DocumentHost,
+        task_context: Option<&TaskContext<'_>>,
+    ) -> bool {
         if let Some(task_context) = task_context {
             let mut state = self.0.lock().unwrap();
             let stale = state
@@ -101,18 +114,18 @@ impl ScriptQueue {
                 state.waker = Some(task_context.waker().clone());
             }
         }
-        self.drain_into(document) > 0
+        self.drain_into(document, host) > 0
     }
 
-    pub fn drain_into(&self, document: &mut ScriptDocument) -> usize {
+    pub fn drain_into(&self, document: &mut dyn Document, host: &dyn DocumentHost) -> usize {
         let tasks: Vec<ScriptTask> = self.0.lock().unwrap().tasks.drain(..).collect();
         let count = tasks.len();
         for task in tasks {
             match task {
-                ScriptTask::Evaluate(script) => document.eval(&script),
+                ScriptTask::Evaluate(script) => host.eval(document, &script),
                 ScriptTask::EvaluateWithCallback(script, callback) => {
-                    let result = document
-                        .eval_json(&script)
+                    let result = host
+                        .eval_json(document, &script)
                         .map(|value| value.to_string())
                         .unwrap_or_else(|_| "null".into());
                     callback(result);

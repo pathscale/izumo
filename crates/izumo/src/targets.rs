@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use blitz_control_protocol::in_process::DocumentControl;
 use blitz_control_protocol::{DebugResponse, DiagnosticsRequest, TargetContext, TargetInfo};
-use blitz_script::ScriptDocument;
+use blitz_dom::Document;
 
 #[derive(Clone)]
 pub struct PageTarget {
@@ -14,7 +14,7 @@ pub struct PageTarget {
 
 type Provider = dyn Fn() -> Vec<PageTarget> + Send + Sync;
 type Navigation = dyn Fn(u64, &str) -> Result<(), String> + Send + Sync;
-type Diagnostics = dyn Fn(&mut ScriptDocument, DiagnosticsRequest) -> DebugResponse + Send + Sync;
+type Diagnostics = dyn Fn(&mut dyn Document, DiagnosticsRequest) -> DebugResponse + Send + Sync;
 
 static PROVIDER: OnceLock<RwLock<Option<Arc<Provider>>>> = OnceLock::new();
 static NAVIGATION: OnceLock<RwLock<Option<Arc<Navigation>>>> = OnceLock::new();
@@ -34,7 +34,7 @@ pub fn set_page_navigation_handler(
 }
 
 pub fn set_page_diagnostics_handler(
-    handler: impl Fn(&mut ScriptDocument, DiagnosticsRequest) -> DebugResponse + Send + Sync + 'static,
+    handler: impl Fn(&mut dyn Document, DiagnosticsRequest) -> DebugResponse + Send + Sync + 'static,
 ) {
     *DIAGNOSTICS
         .get_or_init(|| RwLock::new(None))
@@ -82,7 +82,7 @@ pub(crate) fn navigate(id: u64, url: &str) -> DebugResponse {
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn diagnostics(
-    document: &mut ScriptDocument,
+    document: &mut dyn Document,
     request: DiagnosticsRequest,
 ) -> DebugResponse {
     let handler = DIAGNOSTICS
