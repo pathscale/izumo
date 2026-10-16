@@ -116,4 +116,3 @@ not inject Command-modified keys or wheel input, treated descendants of
 `display:none` retained views as displayed, exposed revision counters without
 real timings, allowed only one session, and lost its environment during an
 AppKit/LaunchServices relaunch. Each is an acceptance case for this protocol.
-
