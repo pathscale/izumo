@@ -236,4 +236,3 @@ Keep the Stage 1.5 surface small. Add network inspection, CSS rule provenance, a
 trees, memory/GC statistics, pushed events, or interactive JavaScript breakpoints only in
 response to a demonstrated debugging need. Protocol additions are versioned capabilities so
 old clients fail clearly rather than misreading new responses.
-

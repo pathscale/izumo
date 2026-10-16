@@ -262,8 +262,12 @@ enum RuntimeMessage {
 
 struct RuntimeApplication {
     blitz: RefCell<BlitzApplication<VelloWindowRenderer>>,
-    #[cfg(all(feature = "agent-control", unix))]
+    #[cfg(any(feature = "debug-control", all(feature = "agent-control", unix)))]
     host: Arc<dyn DocumentHost>,
+    #[cfg(feature = "debug-control")]
+    debug_controller: Option<blitz_script::DebugController>,
+    #[cfg(feature = "debug-control")]
+    debug_paints: std::collections::HashMap<winit::window::WindowId, u64>,
     app: App,
     setup_result: Arc<Mutex<Option<AppResult>>>,
     #[cfg(all(feature = "agent-control", unix))]
@@ -862,6 +866,33 @@ impl RuntimeApplication {
     }
 }
 
+#[cfg(feature = "debug-control")]
+impl RuntimeApplication {
+    fn service_debug_controller(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(controller) = self.debug_controller.as_mut() else {
+            return;
+        };
+        let blitz = self.blitz.get_mut();
+        self.debug_paints
+            .retain(|id, _| blitz.windows.contains_key(id));
+        for (id, view) in &blitz.windows {
+            let previous = self.debug_paints.entry(*id).or_default();
+            for _ in *previous..view.submitted_paint {
+                controller.note_paint_committed();
+            }
+            *previous = view.submitted_paint;
+        }
+        let serviced = blitz.windows.values_mut().any(|view| {
+            let animation_time = view.current_animation_time();
+            self.host
+                .service_debug_controller(view.doc.as_mut(), controller, animation_time)
+        });
+        if serviced && controller.exit_requested() {
+            event_loop.exit();
+        }
+    }
+}
+
 impl ApplicationHandler for RuntimeApplication {
     #[cfg(target_os = "macos")]
     fn macos_handler(&mut self) -> Option<&mut dyn ApplicationHandlerExtMacOS> {
@@ -975,6 +1006,8 @@ impl ApplicationHandler for RuntimeApplication {
             return;
         }
         self.blitz.get_mut().proxy_wake_up(event_loop);
+        #[cfg(feature = "debug-control")]
+        self.service_debug_controller(event_loop);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
     }
@@ -986,6 +1019,8 @@ impl ApplicationHandler for RuntimeApplication {
             return;
         }
         self.blitz.get_mut().about_to_wait(event_loop);
+        #[cfg(feature = "debug-control")]
+        self.service_debug_controller(event_loop);
         self.observe_surfaces(&[], false);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
@@ -1076,22 +1111,30 @@ pub(crate) fn run(app: App) -> AppResult {
             .unwrap() = Some(Arc::downgrade(&runtime));
         (runtime, event_sender)
     };
-    let mut blitz = BlitzApplication::new(proxy, blitz_receiver);
     #[cfg(feature = "debug-control")]
-    if let Some(mut controller) =
+    let debug_controller = if let Some(mut controller) =
         blitz_script::DebugController::start_from_env(env!("CARGO_PKG_VERSION"))?
     {
         let (width, height) = debug_screenshot_size_from_env().unwrap_or((1344, 932));
         controller = controller.with_cpu_screenshot(width, height);
-        blitz.set_debug_controller(controller);
-    }
+        let debug_proxy = proxy.clone();
+        controller.set_waker(move || debug_proxy.wake_up());
+        Some(controller)
+    } else {
+        None
+    };
+    let mut blitz = BlitzApplication::new(proxy, blitz_receiver);
     let handle = app.handle();
     let _host = register_window(&handle, &mut blitz, app.window_spec())?;
     let setup_result = Arc::new(Mutex::new(None));
     let application = RuntimeApplication {
         blitz: RefCell::new(blitz),
-        #[cfg(all(feature = "agent-control", unix))]
+        #[cfg(any(feature = "debug-control", all(feature = "agent-control", unix)))]
         host: _host,
+        #[cfg(feature = "debug-control")]
+        debug_controller,
+        #[cfg(feature = "debug-control")]
+        debug_paints: std::collections::HashMap::new(),
         app,
         setup_result: Arc::clone(&setup_result),
         #[cfg(all(feature = "agent-control", unix))]

@@ -76,4 +76,3 @@ Every embedder should:
 6. Measure the shipped binary with deep profiling off and on. The disabled
    result is the performance acceptance case; the enabled result quantifies the
    deliberate profiling tax.
-
