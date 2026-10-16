@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use anyrender_vello::VelloWindowRenderer;
 #[cfg(feature = "hybrid-renderer")]
 use anyrender_vello_hybrid::VelloHybridWindowRenderer as VelloWindowRenderer;
-use blitz_script::ScriptDocument;
 use blitz_shell::{
     BlitzApplication, BlitzShellProxy, WindowConfig as BlitzShellWindowConfig,
     create_default_event_loop,
@@ -30,13 +29,11 @@ use winit::platform::macos::{ApplicationHandlerExtMacOS, WindowAttributesMacOS};
 use winit::platform::windows::WindowAttributesWindows;
 
 #[cfg(all(feature = "diagnostics", unix))]
-use blitz_control_protocol::document::snapshot_document;
+use blitz_control_protocol::WindowComposition;
 #[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::journal::DiagnosticJournal;
 #[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::latest::Once;
-#[cfg(all(feature = "diagnostics", unix))]
-use blitz_control_protocol::{SnapshotRequest, WindowComposition};
 #[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::{
     TargetCapabilities, TargetCommand, TargetContext, TargetId, TargetInfo, TargetOptions,
@@ -58,7 +55,9 @@ use blitz_control_protocol::{
  */
 #[cfg(target_os = "macos")]
 use crate::TitleBarStyle;
-use crate::{App, AppHandle, AppResult, WindowSpec, attach_ipc_handler};
+use crate::document::{ApplicationDocument, DocumentHost};
+use crate::ipc::attach_ipc_handler_for_url;
+use crate::{App, AppHandle, AppResult, WindowSpec};
 #[cfg(all(feature = "diagnostics", unix))]
 use blitz_control_protocol::DiagnosticsRequest;
 #[cfg(all(feature = "agent-control", unix))]
@@ -68,7 +67,7 @@ use blitz_control_protocol::server::{
 #[cfg(all(feature = "agent-control", unix))]
 use blitz_control_protocol::{AgentControlRequest, DebugError, DebugEvent, DebugResponse};
 
-type DocumentFactory = dyn Fn(&str) -> Result<ScriptDocument, String> + Send + Sync + 'static;
+type DocumentFactory = dyn Fn(&str) -> Result<ApplicationDocument, String> + Send + Sync + 'static;
 type RuntimeTrace = dyn Fn(&str) + Send + Sync + 'static;
 
 static DOCUMENT_FACTORY: OnceLock<RwLock<Option<Arc<DocumentFactory>>>> = OnceLock::new();
@@ -81,8 +80,15 @@ static AGENT_CONTROL_RUNTIME: OnceLock<Mutex<Option<Weak<Mutex<AgentControlRunti
 ///
 /// The factory receives WindowSpec::url. The runtime attaches the application
 /// IPC bridge and ScriptQueue before the document's first native poll.
+/// Return [`ApplicationDocument`] with the selected engine's [`DocumentHost`].
+/// The host must also support every child document mounted under this root.
+///
+/// The chrome document and all scripts it executes must be trusted. The factory
+/// must set the document's actual source URL before returning it. IPC from an
+/// HTTP or HTTPS requested or actual document URL is denied unless explicitly
+/// permitted by [`crate::set_remote_ipc_policy`].
 pub fn set_document_factory(
-    factory: impl Fn(&str) -> Result<ScriptDocument, String> + Send + Sync + 'static,
+    factory: impl Fn(&str) -> Result<ApplicationDocument, String> + Send + Sync + 'static,
 ) {
     *DOCUMENT_FACTORY
         .get_or_init(|| RwLock::new(None))
@@ -236,7 +242,7 @@ fn runtime_trace(message: &str) {
     }
 }
 
-fn create_document(url: &str) -> AppResult<ScriptDocument> {
+fn create_document(url: &str) -> AppResult<ApplicationDocument> {
     let factory = DOCUMENT_FACTORY
         .get_or_init(|| RwLock::new(None))
         .read()
@@ -256,6 +262,12 @@ enum RuntimeMessage {
 
 struct RuntimeApplication {
     blitz: RefCell<BlitzApplication<VelloWindowRenderer>>,
+    #[cfg(any(feature = "debug-control", all(feature = "agent-control", unix)))]
+    host: Arc<dyn DocumentHost>,
+    #[cfg(feature = "debug-control")]
+    debug_controller: Option<blitz_script::DebugController>,
+    #[cfg(feature = "debug-control")]
+    debug_paints: std::collections::HashMap<winit::window::WindowId, u64>,
     app: App,
     setup_result: Arc<Mutex<Option<AppResult>>>,
     #[cfg(all(feature = "agent-control", unix))]
@@ -285,9 +297,8 @@ fn with_target_document(
     page: Option<&crate::targets::PageTarget>,
     context: &TargetContext,
     prepare_layout: bool,
-    execute: impl FnOnce(&mut ScriptDocument) -> DebugResponse,
+    execute: impl FnOnce(&mut dyn blitz_dom::Document) -> DebugResponse,
 ) -> DebugResponse {
-    use blitz_dom::Document as _;
     let unavailable = || {
         DebugResponse::Error(blitz_control_protocol::target::error(
             "targetUnavailable",
@@ -300,7 +311,7 @@ fn with_target_document(
     let Some(root) = blitz
         .windows
         .values_mut()
-        .filter_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
+        .map(|view| view.doc.as_mut())
         .find(|document| document.inner().id() as u64 == owner)
     else {
         return unavailable();
@@ -336,10 +347,7 @@ fn with_target_document(
                 "the mount now owns a different document",
             ));
         }
-        let Some(document) = (child as &mut dyn std::any::Any).downcast_mut::<ScriptDocument>()
-        else {
-            return unavailable();
-        };
+        let document: &mut dyn blitz_dom::Document = child;
         if let Some(viewport) = viewport {
             let changed = document.inner().viewport() != &viewport;
             if changed {
@@ -362,12 +370,12 @@ fn with_target_document(
 #[cfg(all(feature = "agent-control", unix))]
 impl RuntimeApplication {
     fn chrome_context(&mut self) -> Option<TargetContext> {
-        use blitz_dom::Document as _;
         self.blitz
             .get_mut()
             .windows
             .values_mut()
-            .find_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
+            .map(|view| view.doc.as_mut())
+            .next()
             .map(|document| TargetContext {
                 target_id: if crate::targets::has_provider() {
                     TargetId::chrome()
@@ -389,13 +397,12 @@ impl RuntimeApplication {
     }
 
     fn list_targets(&mut self) -> DebugResponse {
-        use blitz_dom::Document as _;
         let mut targets: Vec<TargetInfo> = self
             .blitz
             .get_mut()
             .windows
             .values_mut()
-            .filter_map(|view| view.try_downcast_doc_mut::<ScriptDocument>())
+            .map(|view| view.doc.as_mut())
             .take(1)
             .map(|document| TargetInfo {
                 id: if crate::targets::has_provider() {
@@ -403,9 +410,10 @@ impl RuntimeApplication {
                 } else {
                     TargetId::Tab(0)
                 },
-                url: document
-                    .current_url()
-                    .map_or_else(String::new, ToString::to_string),
+                url: self
+                    .host
+                    .current_url(document)
+                    .map_or_else(String::new, |url| url.to_string()),
                 title: "Chrome".into(),
                 active: true,
                 generation: if crate::targets::has_provider() {
@@ -554,6 +562,7 @@ impl RuntimeApplication {
             return DebugResponse::Error(error);
         }
         let state = self.targets.state(&context);
+        let host = Arc::clone(&self.host);
         let result = with_target_document(
             self.blitz.get_mut(),
             page.as_ref(),
@@ -569,38 +578,15 @@ impl RuntimeApplication {
                         )),
                     }
                 }
-                TargetCommand::Agent(request) => state.control.agent(document, request),
+                TargetCommand::Agent(request) => host.agent(document, &mut state.control, request),
                 #[cfg(feature = "diagnostics")]
                 TargetCommand::Diagnostics(request) => match request {
                     DiagnosticsRequest::Observe { .. } => DebugResponse::Ack,
-                    DiagnosticsRequest::Capture(request) => state
-                        .control
-                        .capture(document, request)
-                        .map(DebugResponse::Captured)
-                        .unwrap_or_else(DebugResponse::Error),
-                    DiagnosticsRequest::Snapshot(request) => {
-                        let revision = state.control.next_revision();
-                        snapshot_document(document, request, revision)
-                            .map(DebugResponse::Snapshot)
-                            .unwrap_or_else(DebugResponse::Error)
-                    }
-                    DiagnosticsRequest::Metrics | DiagnosticsRequest::WaitForIdle => {
-                        let idle = matches!(request, DiagnosticsRequest::WaitForIdle);
-                        let revision = state.control.next_revision();
-                        match snapshot_document(
-                            document,
-                            SnapshotRequest {
-                                include_dom: false,
-                                include_layout: false,
-                                include_computed_style: false,
-                                node_ids: Vec::new(),
-                            },
-                            revision,
-                        ) {
-                            Ok(snapshot) if idle => DebugResponse::Idle(snapshot.revisions),
-                            Ok(snapshot) => DebugResponse::Metrics(snapshot.metrics),
-                            Err(error) => DebugResponse::Error(error),
-                        }
+                    DiagnosticsRequest::Capture(_)
+                    | DiagnosticsRequest::Snapshot(_)
+                    | DiagnosticsRequest::Metrics
+                    | DiagnosticsRequest::WaitForIdle => {
+                        host.diagnostics(document, &mut state.control, request)
                     }
                     request => crate::targets::diagnostics(document, request),
                 },
@@ -639,13 +625,15 @@ impl RuntimeApplication {
             for (context, page) in routes {
                 let state = self.targets.state(&context);
                 let journal = &self.control_events;
+                let host = Arc::clone(&self.host);
                 with_target_document(
                     self.blitz.get_mut(),
                     page.as_ref(),
                     &context,
                     false,
                     |document| {
-                        let batch = document.diagnostic_batch(
+                        let batch = host.diagnostic_batch(
+                            document,
                             state.console_sequence,
                             state.error_sequence,
                             1000,
@@ -878,6 +866,33 @@ impl RuntimeApplication {
     }
 }
 
+#[cfg(feature = "debug-control")]
+impl RuntimeApplication {
+    fn service_debug_controller(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(controller) = self.debug_controller.as_mut() else {
+            return;
+        };
+        let blitz = self.blitz.get_mut();
+        self.debug_paints
+            .retain(|id, _| blitz.windows.contains_key(id));
+        for (id, view) in &blitz.windows {
+            let previous = self.debug_paints.entry(*id).or_default();
+            for _ in *previous..view.submitted_paint {
+                controller.note_paint_committed();
+            }
+            *previous = view.submitted_paint;
+        }
+        let serviced = blitz.windows.values_mut().any(|view| {
+            let animation_time = view.current_animation_time();
+            self.host
+                .service_debug_controller(view.doc.as_mut(), controller, animation_time)
+        });
+        if serviced && controller.exit_requested() {
+            event_loop.exit();
+        }
+    }
+}
+
 impl ApplicationHandler for RuntimeApplication {
     #[cfg(target_os = "macos")]
     fn macos_handler(&mut self) -> Option<&mut dyn ApplicationHandlerExtMacOS> {
@@ -991,6 +1006,8 @@ impl ApplicationHandler for RuntimeApplication {
             return;
         }
         self.blitz.get_mut().proxy_wake_up(event_loop);
+        #[cfg(feature = "debug-control")]
+        self.service_debug_controller(event_loop);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
     }
@@ -1002,6 +1019,8 @@ impl ApplicationHandler for RuntimeApplication {
             return;
         }
         self.blitz.get_mut().about_to_wait(event_loop);
+        #[cfg(feature = "debug-control")]
+        self.service_debug_controller(event_loop);
         self.observe_surfaces(&[], false);
         #[cfg(all(feature = "agent-control", unix))]
         self.publish_target_events();
@@ -1092,20 +1111,30 @@ pub(crate) fn run(app: App) -> AppResult {
             .unwrap() = Some(Arc::downgrade(&runtime));
         (runtime, event_sender)
     };
-    let mut blitz = BlitzApplication::new(proxy, blitz_receiver);
     #[cfg(feature = "debug-control")]
-    if let Some(mut controller) =
+    let debug_controller = if let Some(mut controller) =
         blitz_script::DebugController::start_from_env(env!("CARGO_PKG_VERSION"))?
     {
         let (width, height) = debug_screenshot_size_from_env().unwrap_or((1344, 932));
         controller = controller.with_cpu_screenshot(width, height);
-        blitz.set_debug_controller(controller);
-    }
+        let debug_proxy = proxy.clone();
+        controller.set_waker(move || debug_proxy.wake_up());
+        Some(controller)
+    } else {
+        None
+    };
+    let mut blitz = BlitzApplication::new(proxy, blitz_receiver);
     let handle = app.handle();
-    register_window(&handle, &mut blitz, app.window_spec())?;
+    let _host = register_window(&handle, &mut blitz, app.window_spec())?;
     let setup_result = Arc::new(Mutex::new(None));
     let application = RuntimeApplication {
         blitz: RefCell::new(blitz),
+        #[cfg(any(feature = "debug-control", all(feature = "agent-control", unix)))]
+        host: _host,
+        #[cfg(feature = "debug-control")]
+        debug_controller,
+        #[cfg(feature = "debug-control")]
+        debug_paints: std::collections::HashMap::new(),
         app,
         setup_result: Arc::clone(&setup_result),
         #[cfg(all(feature = "agent-control", unix))]
@@ -1143,7 +1172,11 @@ fn relaunch_current_process() -> std::io::Result<()> {
         return Ok(());
     }
     std::process::Command::new(executable)
-        .args(std::env::args_os().skip(1))
+        .args(
+            std::env::args_os()
+                .skip(1)
+                .filter(|arg| arg != std::ffi::OsStr::new("--blitz-control")),
+        )
         .spawn()?;
     Ok(())
 }
@@ -1172,11 +1205,15 @@ fn register_window(
     handle: &AppHandle,
     application: &mut BlitzApplication<VelloWindowRenderer>,
     config: WindowSpec,
-) -> AppResult {
+) -> AppResult<Arc<dyn DocumentHost>> {
     runtime_trace("native window registration entered");
-    let mut document = create_document(&config.url)?;
-    handle.script_queue().attach_to(&mut document);
-    attach_ipc_handler(&mut document, handle.clone());
+    let ApplicationDocument { mut document, host } = create_document(&config.url)?;
+    attach_ipc_handler_for_url(
+        document.as_mut(),
+        Arc::clone(&host),
+        handle.clone(),
+        url::Url::parse(&config.url).ok(),
+    );
 
     let attributes = window_attributes(&config);
     let handle_for_creation = handle.clone();
@@ -1217,7 +1254,7 @@ fn register_window(
                 .base_color(background_color),
         )
     };
-    let window = BlitzShellWindowConfig::with_attributes(Box::new(document), renderer, attributes)
+    let window = BlitzShellWindowConfig::with_attributes(document, renderer, attributes)
         .with_on_created(move |native| {
             // Setup runs after attributes were snapshotted. Binding replays
             // the current visibility, including show() on a hidden window.
@@ -1234,7 +1271,7 @@ fn register_window(
     NATIVE_SURFACE_TRANSPARENT.store(config.transparent, Ordering::Release);
     application.add_window(window);
     runtime_trace("native window queued");
-    Ok(())
+    Ok(host)
 }
 
 #[cfg(target_os = "macos")]
