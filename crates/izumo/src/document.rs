@@ -48,6 +48,18 @@ pub trait DocumentHost: Send + Sync + 'static {
     /// Add a hook without replacing hooks previously installed by the embedder.
     fn add_poll_hook(&self, document: &mut dyn Document, hook: DocumentPollHook);
 
+    /// Service the optional debug controller through the selected engine.
+    /// Return false for documents the backend cannot inspect, leaving queued
+    /// requests available for another window. The backend resolves its concrete
+    /// DebugDocument type here, on the document's owning thread.
+    #[cfg(feature = "debug-control")]
+    fn service_debug_controller(
+        &self,
+        document: &mut dyn Document,
+        controller: &mut blitz_script::DebugController,
+        animation_time: f64,
+    ) -> bool;
+
     #[cfg(all(feature = "agent-control", unix))]
     fn agent(
         &self,
