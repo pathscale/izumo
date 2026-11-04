@@ -308,63 +308,67 @@ fn with_target_document(
     let owner = page
         .and_then(|page| page.owner_document_id)
         .unwrap_or(context.document_id);
-    let Some(root) = blitz
+    let Some(view) = blitz
         .windows
         .values_mut()
-        .map(|view| view.doc.as_mut())
-        .find(|document| document.inner().id() as u64 == owner)
+        .find(|view| view.doc.as_ref().inner().id() as u64 == owner)
     else {
         return unavailable();
     };
-    if let Some(page) = page {
-        let Some(mount) = page.mount_node_id else {
-            return unavailable();
-        };
-        let viewport = if prepare_layout {
-            let inner = root.inner();
-            let mut viewport = inner.viewport().clone();
-            let size = page
-                .viewport_node_id
-                .and_then(|id| inner.get_node(blitz_dom::NodeId::from_u64(id)))
-                .map(|node| node.final_layout().size);
-            size.filter(|size| size.width > 0.0 && size.height > 0.0)
-                .map(|size| {
-                    let scale = viewport.scale();
-                    viewport.window_size =
-                        ((size.width * scale) as u32, (size.height * scale) as u32);
-                    viewport
-                })
-        } else {
-            None
-        };
-        let mut inner = root.inner_mut();
-        let Some(child) = inner.subdoc_mut(blitz_dom::NodeId::from_u64(mount)) else {
-            return unavailable();
-        };
-        if child.id() as u64 != context.document_id {
-            return DebugResponse::Error(blitz_control_protocol::target::error(
-                "staleDocument",
-                "the mount now owns a different document",
-            ));
-        }
-        let document: &mut dyn blitz_dom::Document = child;
-        if let Some(viewport) = viewport {
-            let changed = document.inner().viewport() != &viewport;
-            if changed {
-                document.inner_mut().set_viewport(viewport);
+    let result = {
+        let root = view.doc.as_mut();
+        if let Some(page) = page {
+            let Some(mount) = page.mount_node_id else {
+                return unavailable();
+            };
+            let viewport = if prepare_layout {
+                let inner = root.inner();
+                let mut viewport = inner.viewport().clone();
+                let size = page
+                    .viewport_node_id
+                    .and_then(|id| inner.get_node(blitz_dom::NodeId::from_u64(id)))
+                    .map(|node| node.final_layout().size);
+                size.filter(|size| size.width > 0.0 && size.height > 0.0)
+                    .map(|size| {
+                        let scale = viewport.scale();
+                        viewport.window_size =
+                            ((size.width * scale) as u32, (size.height * scale) as u32);
+                        viewport
+                    })
+            } else {
+                None
+            };
+            let mut inner = root.inner_mut();
+            let Some(child) = inner.subdoc_mut(blitz_dom::NodeId::from_u64(mount)) else {
+                return unavailable();
+            };
+            if child.id() as u64 != context.document_id {
+                return DebugResponse::Error(blitz_control_protocol::target::error(
+                    "staleDocument",
+                    "the mount now owns a different document",
+                ));
+            }
+            let document: &mut dyn blitz_dom::Document = child;
+            if let Some(viewport) = viewport {
+                if document.inner().viewport() != &viewport {
+                    document.inner_mut().set_viewport(viewport);
+                }
                 document.inner_mut().resolve(0.0);
             }
+            execute(document)
+        } else {
+            if root.inner().id() as u64 != context.document_id {
+                return DebugResponse::Error(blitz_control_protocol::target::error(
+                    "staleDocument",
+                    "the chrome document changed",
+                ));
+            }
+            execute(root)
         }
-        execute(document)
-    } else {
-        if root.inner().id() as u64 != context.document_id {
-            return DebugResponse::Error(blitz_control_protocol::target::error(
-                "staleDocument",
-                "the chrome document changed",
-            ));
-        }
-        execute(root)
-    }
+    };
+    view.request_poll();
+    view.request_redraw();
+    result
 }
 
 #[cfg(all(feature = "agent-control", unix))]
@@ -911,6 +915,9 @@ impl ApplicationHandler for RuntimeApplication {
                 *self.setup_result.lock().unwrap() = Some(Err(error));
                 event_loop.exit();
                 return;
+            }
+            for view in self.blitz.get_mut().windows.values_mut() {
+                view.is_visible = view.window.is_visible().unwrap_or(true);
             }
             runtime_trace("application setup completed");
         }
