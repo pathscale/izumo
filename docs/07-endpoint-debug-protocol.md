@@ -17,11 +17,9 @@ This plane is for an AI agent or automation client operating the product:
 - pushed tree/lifecycle changes for efficient observation.
 
 Agent-control code is included by the runtime's default `agent-control` feature.
-On Unix, the interface normally starts disabled; embedders apply their
-owner-controlled setting with `apply_runtime_debug_options` after initialization.
-The explicit `--blitz-control` CLI rescue starts the socket before setup,
-without consulting that setting. Applying a disabled setting drops the socket
-and descriptor, including one started by the CLI rescue.
+On Unix, the interface starts disabled. Embedders can apply the owner's
+setting with `apply_runtime_debug_options` during setup. The legacy
+`--blitz-control` flag has no effect on startup.
 
 The enabled interface uses a Unix domain socket, endpoint-libs framing, and
 JSON-RPC 2.0. Calls use the standard MCP `tools/call` method with the
@@ -52,9 +50,9 @@ telemetry unless the second setting is explicitly on.
 
 ## Contract
 
-- Without the CLI rescue, the local agent-control listener and descriptor are
-  absent until enabled by the owner-controlled runtime setting. Disabling that
-  setting removes both.
+- The Unix listener, socket, and discovery descriptor are absent until the
+  embedder enables inspection. Disabling inspection stops the listener and
+  removes the socket and descriptor.
 - Deep profiling can be selected only while inspection/control is enabled;
   disabling either clears retained samples.
 - The Unix socket has a uid-only trust model. A mode-0700 parent directory is
