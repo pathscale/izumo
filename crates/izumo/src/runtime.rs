@@ -1110,7 +1110,7 @@ pub(crate) fn run(app: App) -> AppResult {
         let event_receiver = Arc::clone(&event_sender);
         // The embedder's persisted control state is applied during setup.
         // The CLI rescue starts earlier so QA can attach during startup.
-        let server = if std::env::args().any(|arg| arg == "--blitz-control") {
+        let server = if std::env::args_os().skip(1).any(|arg| arg == std::ffi::OsStr::new("--blitz-control")) {
             Some(AgentControlServer::start_with_journal(
                 bridge.clone(),
                 Host {
