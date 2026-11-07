@@ -1108,26 +1108,10 @@ pub(crate) fn run(app: App) -> AppResult {
         });
         // One bounded ordered journal, with a cursor owned by each connection.
         let event_sender = DiagnosticJournal::new(4096);
-        let event_receiver = Arc::clone(&event_sender);
-        // The embedder's persisted control state is applied during setup.
-        // The CLI rescue starts earlier so QA can attach during startup.
-        let server = if std::env::args_os().skip(1).any(|arg| arg == std::ffi::OsStr::new("--blitz-control")) {
-            Some(AgentControlServer::start_with_journal(
-                bridge.clone(),
-                Host {
-                    name: env!("CARGO_PKG_NAME").into(),
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    diagnostics: cfg!(feature = "diagnostics"),
-                },
-                event_receiver,
-            )?)
-        } else {
-            None
-        };
         let runtime = Arc::new(Mutex::new(AgentControlRuntime {
             bridge,
             events: event_sender.clone(),
-            server,
+            server: None,
         }));
         *AGENT_CONTROL_RUNTIME
             .get_or_init(|| Mutex::new(None))

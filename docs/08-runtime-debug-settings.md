@@ -36,13 +36,11 @@ the same for the collectors they use.
 
 - Compile `izumo/diagnostics` into a build that may need a user
   trace. Compilation makes the capability available; it does not activate it.
-- Both persisted settings default to false. Without `--blitz-control`, disabled
-  inspection creates no agent-control listener, socket, descriptor, or serving
-  task. The CLI rescue explicitly starts that interface before setup without
-  consulting persisted settings; applying inspection off stops it.
-- The built-in relaunch does not forward `--blitz-control`. The replacement
-  must enable inspection again through its normal settings or a fresh explicit
-  launch argument.
+- Both persisted settings default to false. The Unix listener starts only
+  when the embedder enables inspection. Disabling inspection stops the
+  listener and removes its socket and discovery descriptor.
+- The built-in relaunch strips `--blitz-control`. The replacement must enable
+  inspection through its normal settings.
 - The socket uses a mode-0700 parent directory and mode-0600 socket and new
   descriptor. There is no bearer token or application authentication.
 - These settings govern the Unix socket interface. A separately configured

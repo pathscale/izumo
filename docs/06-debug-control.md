@@ -29,11 +29,10 @@ connect; mutations execute on the UI thread without an exclusive automation
 session.
 
 The runtime's default `agent-control` Cargo feature includes this interface on
-Unix. Compilation alone does not start it. Embedders normally enable it through
-`set_agent_control_enabled` or `apply_runtime_debug_options` after loading owner
-settings. The explicit `--blitz-control` CLI rescue starts it before setup,
-without consulting those settings. Applying a disabled setting stops it.
-The built-in relaunch path does not forward the rescue flag.
+Unix. The listener starts disabled. Embedders can apply the owner's setting
+during setup with `set_agent_control_enabled` or `apply_runtime_debug_options`.
+Applying a disabled setting stops the listener. The runtime ignores
+`--blitz-control` at startup, and the built-in relaunch strips it.
 
 The `diagnostics` feature adds diagnostic capabilities. Intrusive profiling
 requires its separate runtime permission. See docs/08 for the complete settings
