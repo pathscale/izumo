@@ -55,15 +55,16 @@ fn number(value: &str) -> u64 {
         .filter(|n| *n > 0 && *n < u64::MAX - 1)
         .unwrap_or_else(|| fail(format!("CAP_BAD_PARAMETER {value:?}")))
 }
-/// APP_CAP_PROFILE=default opts into the defaults supplied by this main.
-/// Otherwise only APP_CAP_MAX_<NAME> selects a cap; APP_CAP_WARN_<NAME> adjusts its warning.
+/// <APP>_CAP_PROFILE=default opts into this main's defaults, where APP is the normalized application name.
+/// Otherwise <APP>_MAX_<NAME> selects a cap and <APP>_WARN_<NAME> adjusts its warning.
 pub fn start(app_name: &'static str, defaults: &[(&'static str, u64)]) -> Arc<Caps> {
-    let profile = std::env::var_os(format!(
+    let profile_key = format!(
         "{}_CAP_PROFILE",
         app_name.replace('-', "_").to_uppercase()
-    ));
+    );
+    let profile = std::env::var_os(&profile_key);
     if profile.as_deref().is_some_and(|s| s != "default") {
-        fail("CAP_BAD_PARAMETER APP_CAP_PROFILE");
+        fail(format!("CAP_BAD_PARAMETER {profile_key}"));
     }
     let mut budgets = BTreeMap::new();
     for name in NAMES {
@@ -433,4 +434,39 @@ pub fn bytes(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
 }
 pub fn text(path: impl AsRef<Path>) -> std::io::Result<String> {
     read_string(path)
+}
+
+#[cfg(test)]
+mod profile_key_tests {
+    use super::start;
+    use std::process::Command;
+
+    #[test]
+    fn invalid_profile_reports_the_normalized_key_without_its_value() {
+        let output = Command::new(std::env::current_exe().expect("test executable path"))
+            .args([
+                "--exact",
+                "caps::profile_key_tests::invalid_profile_child",
+                "--nocapture",
+            ])
+            .env("IZUMO_CAP_PROFILE_CHILD", "1")
+            .env("TAURI_RUNTIME_LINK_CHECK_CAP_PROFILE", "invalid")
+            .output()
+            .expect("spawn isolated profile check");
+
+        assert_eq!(output.status.code(), Some(78));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.lines().any(|line| {
+            line == "CAP_ERROR CAP_BAD_PARAMETER TAURI_RUNTIME_LINK_CHECK_CAP_PROFILE"
+        }));
+        assert!(!stderr.contains("APP_CAP_PROFILE"));
+        assert!(!stderr.contains("invalid"));
+    }
+
+    #[test]
+    fn invalid_profile_child() {
+        if std::env::var_os("IZUMO_CAP_PROFILE_CHILD").is_some() {
+            start("tauri-runtime-link-check", &[]);
+        }
+    }
 }
