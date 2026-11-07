@@ -297,6 +297,7 @@ fn with_target_document(
     page: Option<&crate::targets::PageTarget>,
     context: &TargetContext,
     prepare_layout: bool,
+    refresh_view: bool,
     execute: impl FnOnce(&mut dyn blitz_dom::Document) -> DebugResponse,
 ) -> DebugResponse {
     let unavailable = || {
@@ -366,8 +367,10 @@ fn with_target_document(
             execute(root)
         }
     };
-    view.request_poll();
-    view.request_redraw();
+    if refresh_view {
+        view.request_poll();
+        view.request_redraw();
+    }
     result
 }
 
@@ -565,6 +568,17 @@ impl RuntimeApplication {
         if let Err(error) = context.validate(&request) {
             return DebugResponse::Error(error);
         }
+        let refresh_view = matches!(
+            &request.command,
+            TargetCommand::Agent(
+                AgentControlRequest::Act(_) | AgentControlRequest::Navigate { .. }
+            )
+        );
+        #[cfg(feature = "diagnostics")]
+        let refresh_view = refresh_view || matches!(
+            &request.command,
+            TargetCommand::Diagnostics(DiagnosticsRequest::Evaluate { .. })
+        );
         let state = self.targets.state(&context);
         let host = Arc::clone(&self.host);
         let result = with_target_document(
@@ -572,6 +586,7 @@ impl RuntimeApplication {
             page.as_ref(),
             &context,
             true,
+            refresh_view,
             |document| match request.command {
                 TargetCommand::Agent(AgentControlRequest::Navigate { url }) => {
                     match context.target_id {
@@ -634,6 +649,7 @@ impl RuntimeApplication {
                     self.blitz.get_mut(),
                     page.as_ref(),
                     &context,
+                    false,
                     false,
                     |document| {
                         let batch = host.diagnostic_batch(
