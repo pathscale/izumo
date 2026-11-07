@@ -604,7 +604,8 @@ impl RuntimeApplication {
                     DiagnosticsRequest::Capture(_)
                     | DiagnosticsRequest::Snapshot(_)
                     | DiagnosticsRequest::Metrics
-                    | DiagnosticsRequest::WaitForIdle => {
+                    | DiagnosticsRequest::WaitForIdle
+                    | DiagnosticsRequest::Evaluate { .. } => {
                         host.diagnostics(document, &mut state.control, request)
                     }
                     request => crate::targets::diagnostics(document, request),
