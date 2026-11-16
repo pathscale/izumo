@@ -28,7 +28,7 @@ pub fn set_remote_ipc_policy(policy: impl Fn(&url::Url) -> bool + Send + Sync + 
     *REMOTE_IPC_POLICY
         .get_or_init(|| RwLock::new(None))
         .write()
-        .unwrap() = Some(Arc::new(policy));
+        .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(policy));
 }
 
 /// The chrome client. Install before executing the document's own scripts.
@@ -211,7 +211,7 @@ pub(crate) fn attach_ipc_handler_for_url(
                 let policy = REMOTE_IPC_POLICY
                     .get_or_init(|| RwLock::new(None))
                     .read()
-                    .unwrap()
+                    .unwrap_or_else(|error| error.into_inner())
                     .clone();
                 let permitted = policy
                     .as_ref()

@@ -353,8 +353,8 @@ fn with_target_document(
             if let Some(viewport) = viewport {
                 if document.inner().viewport() != &viewport {
                     document.inner_mut().set_viewport(viewport);
+                    document.inner_mut().resolve(0.0);
                 }
-                document.inner_mut().resolve(0.0);
             }
             execute(document)
         } else {
