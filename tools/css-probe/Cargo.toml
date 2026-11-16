@@ -9,9 +9,9 @@ nagoya = "^0.1.12"
 libc = "^0.2.189"
 anyrender = { package = "ps-anyrender", version = "^0.13" }
 anyrender_vello_cpu = { package = "ps-anyrender-vello-cpu", version = "^0.17.3", features = ["multithreading"] }
-blitz-dom = { package = "ps-blitz-dom", version = "^0.6", features = ["system-fonts"] }
-blitz-html = { package = "ps-blitz-html", version = "^0.6" }
-blitz-paint = { package = "ps-blitz-paint", version = "^0.6" }
-blitz-traits = { package = "ps-blitz-traits", version = "^0.6" }
+blitz-dom = { package = "ps-blitz-dom", version = "^0.7.0", features = ["system-fonts"] }
+blitz-html = { package = "ps-blitz-html", version = "^0.7.0" }
+blitz-paint = { package = "ps-blitz-paint", version = "^0.7.0" }
+blitz-traits = { package = "ps-blitz-traits", version = "^0.7.0" }
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 url = "2"
