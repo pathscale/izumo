@@ -16,7 +16,7 @@ Local MCP client
       |
       | Unix domain socket, endpoint-libs framing, JSON-RPC 2.0
       v
-blitz-control-protocol server on nagoya
+blitz-control-protocol server thread
       |
       | typed request and response hand-off
       v
